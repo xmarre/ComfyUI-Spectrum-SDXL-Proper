@@ -1,4 +1,4 @@
-# ComfyUI Spectrum SDXL Native
+# ComfyUI Spectrum SDXL Proper
 
 Native ComfyUI custom node that ports **Spectrum** to the **SDXL / U-Net** execution path.
 
@@ -41,7 +41,7 @@ This repo instead patches the native ComfyUI `UNetModel._forward(...)` path and 
 Clone or copy this repository into your ComfyUI `custom_nodes` directory:
 
 ```bash
-git clone <this-repo> ComfyUI/custom_nodes/ComfyUI-Spectrum-SDXL-Native
+git clone <this-repo> ComfyUI/custom_nodes/ComfyUI-Spectrum-SDXL-Proper
 ```
 
 Then restart ComfyUI.
@@ -227,7 +227,7 @@ This repo reproduces ComfyUI’s current internal SDXL `UNetModel._forward(...)`
 ## Repository structure
 
 ```text
-ComfyUI-Spectrum-SDXL-Native/
+ComfyUI-Spectrum-SDXL-Proper/
 ├── __init__.py
 ├── nodes.py
 ├── pyproject.toml

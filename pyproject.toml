@@ -1,12 +1,18 @@
 [project]
-name = "comfyui-spectrum-sdxl-native"
+name = "comfyui-spectrum-sdxl-proper"
 version = "0.1.0"
-description = "Native ComfyUI SDXL Spectrum forecaster node"
+description = "Native ComfyUI SDXL Spectrum forecaster node with proper internal U-Net integration"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "GPL-3.0-or-later" }
 
+[project.urls]
+Repository = "https://github.com/xmarre/ComfyUI-Spectrum-SDXL-Proper"
+Documentation = "https://github.com/xmarre/ComfyUI-Spectrum-SDXL-Proper#readme"
+"Bug Tracker" = "https://github.com/xmarre/ComfyUI-Spectrum-SDXL-Proper/issues"
+
 [tool.comfy]
-PublisherId = "openai"
-DisplayName = "ComfyUI Spectrum SDXL Native"
+PublisherId = "xmarre"
+DisplayName = "ComfyUI-Spectrum-SDXL-Proper"
 Icon = ""
+includes = []
