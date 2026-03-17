@@ -1,3 +1,5 @@
+"""Online feature forecasting utilities for Spectrum SDXL."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -8,6 +10,8 @@ import torch
 
 @dataclass
 class _FitCache:
+    """Cached regression fit for a fixed sampler length."""
+
     coeff: torch.Tensor
     feature_shape: torch.Size
     feature_dtype: torch.dtype
@@ -16,15 +20,16 @@ class _FitCache:
 
 class ChebyshevFeatureForecaster:
     """
-    Forecast the final hidden SDXL U-Net feature using:
-      - Chebyshev basis + ridge regression
-      - optional first-order local extrapolation blend
+    Forecast the final hidden SDXL U-Net feature.
 
-    This mirrors the official Spectrum implementation direction, but with
-    step-count-aware normalization instead of a fixed 50-step assumption.
+    The predictor fits a Chebyshev basis with ridge regularization over
+    observed hidden features, then blends that forecast with a local
+    first-order extrapolation. Time is normalized against the current sampler
+    length rather than a hard-coded 50-step schedule.
     """
 
     def __init__(self, degree: int, ridge_lambda: float, blend_weight: float, history_size: int = 100):
+        """Initialize the online forecaster."""
         self.degree = int(degree)
         self.ridge_lambda = float(ridge_lambda)
         self.blend_weight = float(blend_weight)
@@ -32,6 +37,7 @@ class ChebyshevFeatureForecaster:
         self.reset()
 
     def reset(self) -> None:
+        """Clear observed features and any cached regression fit."""
         self.history: List[Tuple[int, torch.Tensor]] = []
         self._feature_shape: Optional[torch.Size] = None
         self._feature_dtype: Optional[torch.dtype] = None
@@ -39,9 +45,11 @@ class ChebyshevFeatureForecaster:
         self._fit_cache: Optional[_FitCache] = None
 
     def ready(self) -> bool:
+        """Return whether enough history exists to attempt a forecast."""
         return len(self.history) >= 2
 
     def update(self, step_idx: int, feature: torch.Tensor) -> None:
+        """Append an observed feature for one global diffusion step."""
         feat = feature.detach()
         if self._feature_shape is None:
             self._feature_shape = feat.shape
@@ -59,10 +67,12 @@ class ChebyshevFeatureForecaster:
         self._fit_cache = None
 
     def _tau(self, step_values: torch.Tensor, total_steps: int) -> torch.Tensor:
+        """Map discrete step indices to the Chebyshev domain ``[-1, 1]``."""
         denom = max(int(total_steps) - 1, 1)
         return (step_values / float(denom)) * 2.0 - 1.0
 
     def _design(self, taus: torch.Tensor, degree: int) -> torch.Tensor:
+        """Construct the Chebyshev design matrix up to the requested degree."""
         taus = taus.reshape(-1, 1)
         cols = [torch.ones((taus.shape[0], 1), device=taus.device, dtype=torch.float32)]
         if degree >= 1:
@@ -72,6 +82,7 @@ class ChebyshevFeatureForecaster:
         return torch.cat(cols[: degree + 1], dim=1)
 
     def _fit_if_needed(self, total_steps: int) -> None:
+        """Fit ridge-regression coefficients if the cache is stale."""
         if self._fit_cache is not None and self._fit_cache.total_steps == int(total_steps):
             return
         if not self.history:
@@ -107,6 +118,7 @@ class ChebyshevFeatureForecaster:
         )
 
     def _predict_chebyshev(self, step_idx: int, total_steps: int) -> torch.Tensor:
+        """Predict a feature using only the fitted Chebyshev basis."""
         assert self._fit_cache is not None
         tau_star = self._tau(
             torch.tensor([int(step_idx)], device=self._fit_cache.coeff.device, dtype=torch.float32),
@@ -117,6 +129,7 @@ class ChebyshevFeatureForecaster:
         return pred
 
     def _predict_linear(self, step_idx: int) -> torch.Tensor:
+        """Predict a feature using local first-order extrapolation."""
         assert self.history
         _, last_feat = self.history[-1]
         if len(self.history) < 2:
@@ -132,6 +145,7 @@ class ChebyshevFeatureForecaster:
         return last_feat + k * (last_feat - prev_feat)
 
     def predict(self, step_idx: int, total_steps: int) -> torch.Tensor:
+        """Predict the hidden feature for a future global diffusion step."""
         if not self.history:
             raise RuntimeError("Spectrum forecaster was asked to predict without history.")
         if len(self.history) == 1:

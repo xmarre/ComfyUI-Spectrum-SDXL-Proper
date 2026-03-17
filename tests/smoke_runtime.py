@@ -1,3 +1,5 @@
+"""Lightweight runtime regression tests for the SDXL Spectrum scheduler."""
+
 from __future__ import annotations
 
 import torch
@@ -7,6 +9,7 @@ from comfyui_spectrum_sdxl.runtime import SpectrumSDXLRuntime
 
 
 def _make_cfg() -> SpectrumSDXLConfig:
+    """Create the default test configuration."""
     return SpectrumSDXLConfig(
         blend_weight=0.5,
         degree=4,
@@ -18,6 +21,7 @@ def _make_cfg() -> SpectrumSDXLConfig:
 
 
 def test_single_stream_forecasts() -> None:
+    """A single stream should warm up, then eventually forecast."""
     runtime = SpectrumSDXLRuntime(_make_cfg())
 
     sample_sigmas = torch.linspace(1.0, 0.0, 6)
@@ -41,6 +45,7 @@ def test_single_stream_forecasts() -> None:
             runtime.observe_actual_feature(decision["stream_key"], decision["global_step_idx"], feature)
         else:
             seen_forecast += 1
+            runtime.finalize_step(decision["stream_key"], decision["global_step_idx"], used_forecast=True)
             pred = runtime.predict_feature(decision["stream_key"], decision["global_step_idx"])
             assert pred.shape == (2, 8, 4, 4)
             assert torch.isfinite(pred).all()
@@ -50,6 +55,7 @@ def test_single_stream_forecasts() -> None:
 
 
 def test_cfg_streams_stay_isolated() -> None:
+    """Two CFG-style streams at the same sigma must keep independent state."""
     runtime = SpectrumSDXLRuntime(_make_cfg())
     sample_sigmas = torch.linspace(1.0, 0.0, 6)
     stream_counts = {
@@ -77,6 +83,7 @@ def test_cfg_streams_stay_isolated() -> None:
                 runtime.observe_actual_feature(decision["stream_key"], decision["global_step_idx"], feature)
             else:
                 stream_counts[uuid]["forecast"] += 1
+                runtime.finalize_step(decision["stream_key"], decision["global_step_idx"], used_forecast=True)
                 pred = runtime.predict_feature(decision["stream_key"], decision["global_step_idx"])
                 assert pred.shape == (2, 8, 4, 4)
                 assert torch.isfinite(pred).all()
@@ -86,6 +93,7 @@ def test_cfg_streams_stay_isolated() -> None:
 
 
 def test_duplicate_actual_updates_are_deduped() -> None:
+    """A repeated actual write for one stream/step must only be recorded once."""
     runtime = SpectrumSDXLRuntime(_make_cfg())
     sample_sigmas = torch.linspace(1.0, 0.0, 4)
     decision = runtime.begin_step(
@@ -111,7 +119,97 @@ def test_duplicate_actual_updates_are_deduped() -> None:
     assert torch.equal(stored_feature, first_feature)
 
 
+def test_forecast_fallback_commits_actual_bookkeeping() -> None:
+    """A rejected forecast should not count as a cached pass."""
+    runtime = SpectrumSDXLRuntime(_make_cfg())
+    sample_sigmas = torch.linspace(1.0, 0.0, 6)
+
+    for i, value in enumerate((1.0, 2.0)):
+        decision = runtime.begin_step(
+            {
+                "sample_sigmas": sample_sigmas,
+                "sigmas": torch.tensor([float(sample_sigmas[i].item())]),
+                "uuids": ["stream-a"],
+                "cond_or_uncond": [0],
+            },
+            torch.tensor([float(i)]),
+            (2, 8, 4, 4),
+        )
+        runtime.observe_actual_feature(
+            decision["stream_key"],
+            decision["global_step_idx"],
+            torch.full((2, 8, 4, 4), value, dtype=torch.float16),
+        )
+
+    decision = runtime.begin_step(
+        {
+            "sample_sigmas": sample_sigmas,
+            "sigmas": torch.tensor([float(sample_sigmas[2].item())]),
+            "uuids": ["stream-a"],
+            "cond_or_uncond": [0],
+        },
+        torch.tensor([2.0]),
+        (2, 8, 4, 4),
+    )
+    assert decision["actual_forward"] is False
+
+    runtime.finalize_step(decision["stream_key"], decision["global_step_idx"], used_forecast=False)
+
+    state = runtime.stream_states[decision["stream_key"]]
+    assert runtime.last_info["forecasted_passes"] == 0
+    assert runtime.last_info["actual_forward_count"] == 3
+    assert state.num_consecutive_cached_steps == 0
+    assert state.decisions_by_global_step[decision["global_step_idx"]]["actual_forward"] is True
+    assert state.decisions_by_global_step[decision["global_step_idx"]]["finalized"] is True
+
+
+def test_observe_retry_after_update_failure() -> None:
+    """A failed update should not poison retries for that step."""
+    runtime = SpectrumSDXLRuntime(_make_cfg())
+    sample_sigmas = torch.linspace(1.0, 0.0, 4)
+    decision = runtime.begin_step(
+        {
+            "sample_sigmas": sample_sigmas,
+            "sigmas": torch.tensor([float(sample_sigmas[0].item())]),
+            "uuids": ["stream-a"],
+            "cond_or_uncond": [0],
+        },
+        torch.tensor([0.0]),
+        (2, 8, 4, 4),
+    )
+    state = runtime.stream_states[decision["stream_key"]]
+    original_update = state.forecaster.update
+
+    def failing_update(step_idx, feature):
+        raise RuntimeError("boom")
+
+    state.forecaster.update = failing_update
+    try:
+        try:
+            runtime.observe_actual_feature(
+                decision["stream_key"],
+                decision["global_step_idx"],
+                torch.full((2, 8, 4, 4), 1.0, dtype=torch.float16),
+            )
+            raise AssertionError("expected update failure")
+        except RuntimeError as exc:
+            assert str(exc) == "boom"
+        assert state.observed_global_steps == set()
+        assert state.forecaster.history == []
+    finally:
+        state.forecaster.update = original_update
+
+    runtime.observe_actual_feature(
+        decision["stream_key"],
+        decision["global_step_idx"],
+        torch.full((2, 8, 4, 4), 2.0, dtype=torch.float16),
+    )
+    assert state.observed_global_steps == {0}
+    assert len(state.forecaster.history) == 1
+
+
 def test_same_schedule_restart_resets_stream_state() -> None:
+    """A lower-step revisit on the same schedule should reset that stream."""
     runtime = SpectrumSDXLRuntime(
         SpectrumSDXLConfig(
             blend_weight=0.5,
@@ -170,6 +268,7 @@ def test_same_schedule_restart_resets_stream_state() -> None:
 
 
 def test_same_schedule_new_token_resets_after_step_zero_abort() -> None:
+    """Step-0 token churn after an abort should reset only the stale stream."""
     runtime = SpectrumSDXLRuntime(_make_cfg())
     sample_sigmas_a = torch.linspace(1.0, 0.0, 4)
     sample_sigmas_b = torch.linspace(1.0, 0.0, 4)
@@ -226,6 +325,7 @@ def test_same_schedule_new_token_resets_after_step_zero_abort() -> None:
 
 
 def test_step_zero_token_churn_across_streams_does_not_reset() -> None:
+    """Step-0 token churn across different streams must not reset the run."""
     runtime = SpectrumSDXLRuntime(_make_cfg())
     sample_sigmas_a = torch.linspace(1.0, 0.0, 4)
     sample_sigmas_b = torch.linspace(1.0, 0.0, 4)
@@ -270,6 +370,7 @@ def test_step_zero_token_churn_across_streams_does_not_reset() -> None:
 
 
 def test_step_zero_same_stream_token_churn_resets_only_that_stream() -> None:
+    """Same-stream step-0 token churn should reset only that stream's state."""
     runtime = SpectrumSDXLRuntime(_make_cfg())
     sample_sigmas_a = torch.linspace(1.0, 0.0, 4)
     sample_sigmas_b = torch.linspace(1.0, 0.0, 4)
@@ -337,6 +438,7 @@ def test_step_zero_same_stream_token_churn_resets_only_that_stream() -> None:
 
 
 def test_mid_run_token_change_does_not_reset() -> None:
+    """Identical-value token churn after step 0 must not flush active state."""
     runtime = SpectrumSDXLRuntime(_make_cfg())
     sample_sigmas_a = torch.linspace(1.0, 0.0, 4)
     sample_sigmas_b = torch.linspace(1.0, 0.0, 4)
@@ -390,6 +492,7 @@ def test_mid_run_token_change_does_not_reset() -> None:
 
 
 def test_missing_stream_identity_fails_open() -> None:
+    """Missing stream identity should conservatively force an actual forward."""
     runtime = SpectrumSDXLRuntime(_make_cfg())
     sample_sigmas = torch.linspace(1.0, 0.0, 4)
     decision = runtime.begin_step(
@@ -402,16 +505,32 @@ def test_missing_stream_identity_fails_open() -> None:
     assert decision["stream_key"] is None
 
 
+def test_global_step_index_uses_cached_schedule_metadata() -> None:
+    """Step lookup should not rebuild the schedule signature after sync."""
+    runtime = SpectrumSDXLRuntime(_make_cfg())
+    sample_sigmas = torch.linspace(1.0, 0.0, 6)
+    runtime._ensure_run_sync({"sample_sigmas": sample_sigmas})
+    runtime._schedule_signature = lambda _transformer_options: (_ for _ in ()).throw(
+        AssertionError("global_step_index should use cached schedule metadata")
+    )
+
+    assert runtime.global_step_index(round(float(sample_sigmas[2].item()), 8)) == 2
+
+
 def main() -> None:
+    """Run the lightweight regression suite without external test tooling."""
     test_single_stream_forecasts()
     test_cfg_streams_stay_isolated()
     test_duplicate_actual_updates_are_deduped()
+    test_forecast_fallback_commits_actual_bookkeeping()
+    test_observe_retry_after_update_failure()
     test_same_schedule_restart_resets_stream_state()
     test_same_schedule_new_token_resets_after_step_zero_abort()
     test_step_zero_token_churn_across_streams_does_not_reset()
     test_step_zero_same_stream_token_churn_resets_only_that_stream()
     test_mid_run_token_change_does_not_reset()
     test_missing_stream_identity_fails_open()
+    test_global_step_index_uses_cached_schedule_metadata()
     print("ok")
 
 

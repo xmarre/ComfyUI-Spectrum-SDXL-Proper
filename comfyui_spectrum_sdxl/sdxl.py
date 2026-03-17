@@ -1,3 +1,5 @@
+"""Native ComfyUI SDXL wrapper logic for Spectrum integration."""
+
 from __future__ import annotations
 
 from dataclasses import asdict
@@ -15,16 +17,19 @@ _BACKEND_KEY = "spectrum_backend"
 
 
 def _clone_model(model: Any) -> Any:
+    """Clone a ComfyUI model when possible, otherwise return it unchanged."""
     return model.clone() if hasattr(model, "clone") else model
 
 
 def _ensure_model_options(model: Any) -> Dict[str, Any]:
+    """Ensure the model exposes a mutable ``model_options`` mapping."""
     if not hasattr(model, "model_options") or model.model_options is None:
         model.model_options = {}
     return model.model_options
 
 
 def _ensure_transformer_options(model: Any) -> Dict[str, Any]:
+    """Ensure ``model_options['transformer_options']`` exists and is mutable."""
     opts = _ensure_model_options(model)
     if "transformer_options" not in opts or opts["transformer_options"] is None:
         opts["transformer_options"] = {}
@@ -32,6 +37,7 @@ def _ensure_transformer_options(model: Any) -> Dict[str, Any]:
 
 
 def _locate_unet_inner_model(model: Any) -> Tuple[Optional[Any], Optional[str]]:
+    """Locate the inner native ComfyUI diffusion model to patch."""
     outer = getattr(model, "model", None)
     if outer is not None and hasattr(outer, "diffusion_model"):
         return outer.diffusion_model, "model.diffusion_model"
@@ -41,6 +47,7 @@ def _locate_unet_inner_model(model: Any) -> Tuple[Optional[Any], Optional[str]]:
 
 
 def _looks_like_comfy_unet(inner: Any) -> bool:
+    """Return whether the located inner model matches the expected U-Net shape."""
     required = (
         "input_blocks",
         "output_blocks",
@@ -52,6 +59,7 @@ def _looks_like_comfy_unet(inner: Any) -> bool:
 
 
 def _resolve_runtime(transformer_options: Dict[str, Any]) -> Optional[SpectrumSDXLRuntime]:
+    """Extract the active Spectrum runtime from transformer options."""
     runtime = transformer_options.get(_RUNTIME_KEY)
     if isinstance(runtime, SpectrumSDXLRuntime):
         return runtime
@@ -59,6 +67,7 @@ def _resolve_runtime(transformer_options: Dict[str, Any]) -> Optional[SpectrumSD
 
 
 def _wrap_sdxl_unet_forward(inner: Any) -> None:
+    """Install the Spectrum-aware wrapper around the native SDXL ``_forward``."""
     if getattr(inner, "_spectrum_sdxl_wrapped", False):
         return
 
@@ -73,6 +82,7 @@ def _wrap_sdxl_unet_forward(inner: Any) -> None:
         transformer_options={},
         **kwargs,
     ):
+        """Run one SDXL denoiser call with Spectrum scheduling."""
         runtime = _resolve_runtime(transformer_options)
         if runtime is None or not runtime.cfg.enabled:
             return original_forward(x, timesteps, context, y, control, transformer_options, **kwargs)
@@ -108,6 +118,7 @@ def _wrap_sdxl_unet_forward(inner: Any) -> None:
                     predicted_h = None
 
             if predicted_h is not None:
+                runtime.finalize_step(stream_key, global_step_idx, used_forecast=True)
                 if getattr(inner, "predict_codebook_ids", False):
                     return inner.id_predictor(predicted_h)
                 return inner.out(predicted_h)
@@ -210,8 +221,11 @@ def _wrap_sdxl_unet_forward(inner: Any) -> None:
 
 
 class SDXLSpectrumPatcher:
+    """Apply the native SDXL Spectrum patch to a ComfyUI model."""
+
     @staticmethod
     def patch(model: Any, cfg: SpectrumSDXLConfig) -> Any:
+        """Clone the model, attach runtime metadata, and patch the inner U-Net."""
         cfg = cfg.validated()
         patched = _clone_model(model)
 

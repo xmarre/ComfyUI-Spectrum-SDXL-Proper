@@ -1,3 +1,5 @@
+"""Configuration model for the native SDXL Spectrum runtime."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -5,6 +7,8 @@ from dataclasses import dataclass
 
 @dataclass
 class SpectrumSDXLConfig:
+    """Validated configuration for SDXL Spectrum scheduling and forecasting."""
+
     enabled: bool = True
     blend_weight: float = 0.50
     degree: int = 4
@@ -16,6 +20,7 @@ class SpectrumSDXLConfig:
     debug: bool = False
 
     def validated(self) -> "SpectrumSDXLConfig":
+        """Validate the configuration in place and return ``self``."""
         if not (0.0 <= float(self.blend_weight) <= 1.0):
             raise ValueError("blend_weight must be in [0, 1].")
         if int(self.degree) < 1:
