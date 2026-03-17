@@ -250,9 +250,9 @@ ControlNet-style residuals applied inside the U-Net are naturally only injected 
 
 ### Approximation relative to the paper
 
-This repo is faithful to the core method, but one practical approximation remains explicit:
+This repo is faithful to the core method, but one practical implementation detail remains explicit:
 
-- the online forecaster uses the **discrete sampler step index** as the time variable for fitting/prediction, matching the official code path more closely than a reconstructed continuous-time parameterization.
+- the online forecaster uses the **active schedule coordinates** derived from `sample_sigmas` as the time variable for fitting/prediction.
 
 ### Compatibility maintenance
 
