@@ -298,18 +298,17 @@ def test_run_id_switch_resets_stream_state() -> None:
 
 
 def test_forecaster_uses_schedule_coordinates_not_ordinal_step_index() -> None:
-    """Linear extrapolation must respect non-uniform schedule spacing."""
+    """Direct forecaster predictions should accept the runtime total-steps contract."""
     forecaster = ChebyshevFeatureForecaster(
         degree=2,
         ridge_lambda=0.1,
         blend_weight=0.0,
         history_size=10,
     )
-    schedule_coords = (10.0, 9.0, 1.0)
     forecaster.update(10.0, torch.tensor([10.0]))
     forecaster.update(9.0, torch.tensor([9.0]))
 
-    pred = forecaster.predict(1.0, schedule_coords)
+    pred = forecaster.predict(1.0, 11)
 
     assert torch.allclose(pred, torch.tensor([1.0]), atol=1e-5)
 
@@ -328,6 +327,7 @@ def main() -> None:
     test_duplicate_actual_updates_are_deduped()
     test_forecast_fallback_commits_actual_bookkeeping()
     test_run_id_switch_resets_stream_state()
+    test_forecaster_uses_schedule_coordinates_not_ordinal_step_index()
     print("ok")
 
 

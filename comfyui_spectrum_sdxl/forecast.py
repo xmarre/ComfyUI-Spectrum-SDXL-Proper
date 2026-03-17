@@ -10,12 +10,12 @@ import torch
 
 @dataclass
 class _FitCache:
-    """Cached regression fit for a fixed schedule coordinate sequence."""
+    """Cached regression fit for a fixed sampler length."""
 
     coeff: torch.Tensor
     feature_shape: torch.Size
     feature_dtype: torch.dtype
-    schedule_coords: Tuple[float, ...]
+    total_steps: int
 
 
 class ChebyshevFeatureForecaster:
@@ -24,8 +24,8 @@ class ChebyshevFeatureForecaster:
 
     The predictor fits a Chebyshev basis with ridge regularization over
     observed hidden features, then blends that forecast with a local
-    first-order extrapolation. Time is normalized against the current denoiser
-    schedule coordinates rather than ordinal step indices.
+    first-order extrapolation. Time is normalized against the current sampler
+    length rather than a hard-coded schedule.
     """
 
     def __init__(self, degree: int, ridge_lambda: float, blend_weight: float, history_size: int = 100):
@@ -83,10 +83,10 @@ class ChebyshevFeatureForecaster:
             cols.append(2.0 * taus.to(torch.float32) * cols[-1] - cols[-2])
         return torch.cat(cols[: degree + 1], dim=1)
 
-    def _fit_if_needed(self, schedule_coords: Tuple[float, ...]) -> None:
+    def _fit_if_needed(self, total_steps: int) -> None:
         """Fit ridge-regression coefficients if the cache is stale."""
-        cached_coords = tuple(float(v) for v in schedule_coords)
-        if self._fit_cache is not None and self._fit_cache.schedule_coords == cached_coords:
+        total_steps = int(total_steps)
+        if self._fit_cache is not None and self._fit_cache.total_steps == total_steps:
             return
         if not self.history:
             raise RuntimeError("Spectrum forecaster was asked to fit without history.")
@@ -96,7 +96,7 @@ class ChebyshevFeatureForecaster:
 
         device = self._feature_device
         time_tensor = torch.tensor([t for t, _ in self.history], device=device, dtype=torch.float32)
-        taus = self._tau(time_tensor, 0)
+        taus = self._tau(time_tensor, total_steps)
         x_mat = self._design(taus, self.degree)
         h_mat = torch.stack([feat.reshape(-1).to(torch.float32) for _, feat in self.history], dim=0)
 
@@ -117,7 +117,7 @@ class ChebyshevFeatureForecaster:
             coeff=coeff,
             feature_shape=self._feature_shape,
             feature_dtype=self._feature_dtype,
-            schedule_coords=cached_coords,
+            total_steps=total_steps,
         )
 
     def _predict_chebyshev(self, time_coord: float, total_steps: int) -> torch.Tensor:
@@ -125,7 +125,7 @@ class ChebyshevFeatureForecaster:
         assert self._fit_cache is not None
         tau_star = self._tau(
             torch.tensor([float(time_coord)], device=self._fit_cache.coeff.device, dtype=torch.float32),
-            0,
+            total_steps,
         )
         x_star = self._design(tau_star, self.degree)
         pred = (x_star @ self._fit_cache.coeff).reshape(self._fit_cache.feature_shape)
@@ -142,7 +142,9 @@ class ChebyshevFeatureForecaster:
         prev_feat = prev_feat.to(torch.float32)
         last_feat = last_feat.to(torch.float32)
 
-        dt = max(float(last_coord - prev_coord), 1e-6)
+        dt = float(last_coord - prev_coord)
+        if abs(dt) < 1e-6:
+            return last_feat
         k = (float(time_coord) - float(last_coord)) / dt
         return last_feat + k * (last_feat - prev_feat)
 
