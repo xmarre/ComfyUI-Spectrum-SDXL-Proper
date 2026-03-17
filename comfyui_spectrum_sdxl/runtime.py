@@ -58,6 +58,9 @@ class SpectrumSDXLRuntime:
         self._pending_schedule_token = None
         self._sigma_to_step: Dict[float, int] = {}
         self._ambiguous_schedule_sigmas: Set[float] = set()
+        self._stream_keys_by_global_step: Dict[int, Set[StreamKey]] = {}
+        self._forecast_disabled = False
+        self._forecast_disable_reason: Optional[str] = None
         self.reset_cycle()
         self.last_info = {
             "enabled": self.cfg.enabled,
@@ -68,6 +71,8 @@ class SpectrumSDXLRuntime:
             "curr_ws": float(self.cfg.window_size),
             "last_sigma": None,
             "last_stream_key": None,
+            "forecast_disabled": False,
+            "forecast_disable_reason": None,
             "active_streams": 0,
             "num_steps": 0,
             "run_id": self.run_id,
@@ -126,8 +131,13 @@ class SpectrumSDXLRuntime:
         self.last_info["curr_ws"] = float(self.cfg.window_size)
         self.last_info["last_sigma"] = None
         self.last_info["last_stream_key"] = None
+        self.last_info["forecast_disabled"] = False
+        self.last_info["forecast_disable_reason"] = None
         self.last_info["active_streams"] = 0
         self.last_info["run_id"] = self.run_id
+        self._stream_keys_by_global_step = {}
+        self._forecast_disabled = False
+        self._forecast_disable_reason = None
 
     def _ensure_run_sync(self, transformer_options: Dict[str, Any]) -> None:
         """Synchronize cached schedule metadata with the current sampler call."""
@@ -264,6 +274,28 @@ class SpectrumSDXLRuntime:
                 "forecast_safe": False,
             }
 
+        step_streams = self._stream_keys_by_global_step.setdefault(global_step_idx, set())
+        step_streams.add(stream_key)
+
+        if not self._forecast_disabled:
+            # Spectrum's SDXL path assumes one denoiser trajectory per solver step.
+            # If warmup already reveals multiple logical streams for one step, this
+            # runtime cannot forecast the same trajectory and must fail open.
+            if len(step_streams) > 1 and global_step_idx < self.cfg.warmup_steps:
+                self._forecast_disabled = True
+                self._forecast_disable_reason = "multi_stream_warmup"
+            elif global_step_idx >= self.cfg.warmup_steps:
+                for step_idx, keys in self._stream_keys_by_global_step.items():
+                    if step_idx >= self.cfg.warmup_steps:
+                        continue
+                    if len(keys) > 1:
+                        self._forecast_disabled = True
+                        self._forecast_disable_reason = "multi_stream_warmup"
+                        break
+
+        self.last_info["forecast_disabled"] = self._forecast_disabled
+        self.last_info["forecast_disable_reason"] = self._forecast_disable_reason
+
         state = None
         if self._pending_schedule_token is not None:
             existing_state = self.stream_states.get(stream_key)
@@ -292,7 +324,7 @@ class SpectrumSDXLRuntime:
         state.local_step_count += 1
 
         actual_forward = True
-        if local_step_count >= self.cfg.warmup_steps:
+        if (not self._forecast_disabled) and global_step_idx >= self.cfg.warmup_steps:
             ws_floor = max(1, math.floor(float(state.curr_ws)))
             actual_forward = ((state.num_consecutive_cached_steps + 1) % ws_floor) == 0
 
@@ -309,7 +341,7 @@ class SpectrumSDXLRuntime:
             "actual_forward": actual_forward,
             "run_id": self.run_id,
             "stream_key": stream_key,
-            "forecast_safe": True,
+            "forecast_safe": not self._forecast_disabled,
             "finalized": False,
         }
         state.decisions_by_global_step[global_step_idx] = decision
@@ -335,7 +367,7 @@ class SpectrumSDXLRuntime:
             self.last_info["forecasted_passes"] += 1
             decision["actual_forward"] = False
         else:
-            if local_step_count >= self.cfg.warmup_steps:
+            if global_step_idx >= self.cfg.warmup_steps:
                 state.curr_ws = round(state.curr_ws + float(self.cfg.flex_window), 3)
             state.num_consecutive_cached_steps = 0
             self.last_info["actual_forward_count"] += 1

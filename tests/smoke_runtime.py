@@ -54,16 +54,12 @@ def test_single_stream_forecasts() -> None:
     assert seen_forecast >= 1
 
 
-def test_cfg_streams_stay_isolated() -> None:
-    """Two CFG-style streams at the same sigma must keep independent state."""
+def test_multi_stream_warmup_disables_forecasting() -> None:
+    """Multiple warmup streams at one solver step must fail open."""
     runtime = SpectrumSDXLRuntime(_make_cfg())
     sample_sigmas = torch.linspace(1.0, 0.0, 6)
-    stream_counts = {
-        "stream-a": {"actual": 0, "forecast": 0},
-        "stream-b": {"actual": 0, "forecast": 0},
-    }
 
-    for i in range(5):
+    for i in range(2):
         sigma = float(sample_sigmas[i].item())
         for uuid, cond in (("stream-a", 0), ("stream-b", 1)):
             transformer_options = {
@@ -73,23 +69,68 @@ def test_cfg_streams_stay_isolated() -> None:
                 "cond_or_uncond": [cond],
             }
             decision = runtime.begin_step(transformer_options, torch.tensor([float(i)]), (2, 8, 4, 4))
-            assert decision["forecast_safe"] is True
+            assert decision["actual_forward"] is True
             assert decision["global_step_idx"] == i
-            assert decision["local_step_count"] == i
+            runtime.observe_actual_feature(
+                decision["stream_key"],
+                decision["global_step_idx"],
+                torch.full((2, 8, 4, 4), float(i + cond), dtype=torch.float16),
+            )
 
-            if decision["actual_forward"]:
-                stream_counts[uuid]["actual"] += 1
-                feature = torch.full((2, 8, 4, 4), float(i + cond), dtype=torch.float16)
-                runtime.observe_actual_feature(decision["stream_key"], decision["global_step_idx"], feature)
-            else:
-                stream_counts[uuid]["forecast"] += 1
-                runtime.finalize_step(decision["stream_key"], decision["global_step_idx"], used_forecast=True)
-                pred = runtime.predict_feature(decision["stream_key"], decision["global_step_idx"])
-                assert pred.shape == (2, 8, 4, 4)
-                assert torch.isfinite(pred).all()
+    decision = runtime.begin_step(
+        {
+            "sample_sigmas": sample_sigmas,
+            "sigmas": torch.tensor([float(sample_sigmas[2].item())]),
+            "uuids": ["stream-a"],
+            "cond_or_uncond": [0],
+        },
+        torch.tensor([2.0]),
+        (2, 8, 4, 4),
+    )
+    assert runtime.last_info["forecast_disabled"] is True
+    assert runtime.last_info["forecast_disable_reason"] == "multi_stream_warmup"
+    assert decision["forecast_safe"] is False
+    assert decision["actual_forward"] is True
 
-    assert stream_counts["stream-a"]["forecast"] >= 1
-    assert stream_counts["stream-b"]["forecast"] >= 1
+
+def test_cfg_streams_keep_isolated_actual_state() -> None:
+    """Two same-step streams must not share runtime state."""
+    runtime = SpectrumSDXLRuntime(_make_cfg())
+    sample_sigmas = torch.linspace(1.0, 0.0, 6)
+
+    decisions = {}
+    for uuid, cond, value in (("stream-a", 0, 10.0), ("stream-b", 1, 20.0)):
+        decision = runtime.begin_step(
+            {
+                "sample_sigmas": sample_sigmas,
+                "sigmas": torch.tensor([float(sample_sigmas[0].item())]),
+                "uuids": [uuid],
+                "cond_or_uncond": [cond],
+            },
+            torch.tensor([0.0]),
+            (2, 8, 4, 4),
+        )
+        assert decision["global_step_idx"] == 0
+        assert decision["actual_forward"] is True
+        runtime.observe_actual_feature(
+            decision["stream_key"],
+            decision["global_step_idx"],
+            torch.full((2, 8, 4, 4), value, dtype=torch.float16),
+        )
+        decisions[uuid] = decision
+
+    state_a = runtime.stream_states[decisions["stream-a"]["stream_key"]]
+    state_b = runtime.stream_states[decisions["stream-b"]["stream_key"]]
+    assert state_a is not state_b
+    assert state_a.observed_global_steps == {0}
+    assert state_b.observed_global_steps == {0}
+    assert len(state_a.forecaster.history) == 1
+    assert len(state_b.forecaster.history) == 1
+
+    _, feature_a = state_a.forecaster.history[0]
+    _, feature_b = state_b.forecaster.history[0]
+    assert torch.equal(feature_a, torch.full((2, 8, 4, 4), 10.0, dtype=torch.float16))
+    assert torch.equal(feature_b, torch.full((2, 8, 4, 4), 20.0, dtype=torch.float16))
 
 
 def test_duplicate_actual_updates_are_deduped() -> None:
@@ -567,7 +608,8 @@ def test_global_step_index_uses_cached_schedule_metadata() -> None:
 def main() -> None:
     """Run the lightweight regression suite without external test tooling."""
     test_single_stream_forecasts()
-    test_cfg_streams_stay_isolated()
+    test_multi_stream_warmup_disables_forecasting()
+    test_cfg_streams_keep_isolated_actual_state()
     test_duplicate_actual_updates_are_deduped()
     test_forecast_fallback_commits_actual_bookkeeping()
     test_observe_retry_after_update_failure()
