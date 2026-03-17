@@ -176,6 +176,28 @@ def test_outer_step_controller_injects_context_and_resets_runs() -> None:
     assert restarted["spectrum_total_steps"] == 4
 
 
+def test_outer_step_controller_same_object_restart_resets_run_state() -> None:
+    """Reusing the exact same schedule tensor for a new run must reset controller state."""
+    runtime = SpectrumSDXLRuntime(_make_cfg())
+    controller = _SpectrumOuterStepController(
+        runtime=runtime,
+        delegate=lambda args: args["model_options"]["transformer_options"].copy(),
+    )
+
+    sample_sigmas = torch.linspace(1.0, 0.0, 6)
+    model_options = {"transformer_options": {"sample_sigmas": sample_sigmas}}
+
+    first = controller({"model_options": model_options, "sigma": torch.tensor([float(sample_sigmas[0].item())])})
+    second = controller({"model_options": model_options, "sigma": torch.tensor([float(sample_sigmas[1].item())])})
+    restarted = controller({"model_options": model_options, "sigma": torch.tensor([float(sample_sigmas[0].item())])})
+
+    assert first["spectrum_run_id"] == second["spectrum_run_id"]
+    assert second["spectrum_solver_step_id"] == 1
+    assert restarted["spectrum_run_id"] != first["spectrum_run_id"]
+    assert restarted["spectrum_solver_step_id"] == 0
+    assert restarted["spectrum_time_coord"] == 0.0
+
+
 def test_outer_step_controller_uses_ordinal_time_coord() -> None:
     """The controller must provide time_coord as raw sigma values (sigma-space)."""
     runtime = SpectrumSDXLRuntime(_make_cfg())
@@ -300,6 +322,7 @@ def main() -> None:
     test_explicit_solver_step_context_allows_forecast()
     test_explicit_solver_step_context_without_decision_still_schedules()
     test_outer_step_controller_injects_context_and_resets_runs()
+    test_outer_step_controller_same_object_restart_resets_run_state()
     test_outer_step_controller_uses_ordinal_time_coord()
     test_forecast_request_before_history_fails_open_per_step()
     test_duplicate_actual_updates_are_deduped()

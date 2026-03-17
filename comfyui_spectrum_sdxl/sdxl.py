@@ -117,6 +117,35 @@ class _SpectrumOuterStepController:
         except (AttributeError, TypeError, ValueError, RuntimeError):
             return ("id", id(sample_sigmas))
 
+    def _sigma_value(self, sigma) -> Optional[float]:
+        """Resolve one scalar sigma value for restart detection."""
+        try:
+            return round(float(sigma.detach().flatten()[0].item()), 8)
+        except Exception:
+            return None
+
+    def _looks_like_same_token_restart(self, args: Dict[str, Any], transformer_options: Dict[str, Any]) -> bool:
+        """
+        Detect a new generation that reuses the exact same schedule tensor object.
+
+        The controller already resets on schedule-token churn. This guard covers
+        the remaining hole where a new generation restarts at the first sigma
+        after prior progress, but ComfyUI reuses the same ``sample_sigmas``
+        tensor object.
+        """
+        if self._next_solver_step_id <= 1:
+            return False
+
+        sample_sigmas = transformer_options.get("sample_sigmas", None)
+        if sample_sigmas is None:
+            return False
+
+        first_sigma = self._sigma_value(sample_sigmas[0])
+        current_sigma = self._sigma_value(args.get("sigma", None))
+        if first_sigma is None or current_sigma is None:
+            return False
+        return current_sigma == first_sigma
+
     def _extract_total_steps(self, transformer_options: Dict[str, Any]) -> int:
         sample_sigmas = transformer_options.get("sample_sigmas", None)
         if sample_sigmas is not None:
@@ -134,6 +163,9 @@ class _SpectrumOuterStepController:
             run_token = ("model_options", id(model_options))
         if run_token != self._current_run_token:
             self._current_run_token = run_token
+            self._run_serial += 1
+            self._next_solver_step_id = 0
+        elif self._looks_like_same_token_restart(args, transformer_options):
             self._run_serial += 1
             self._next_solver_step_id = 0
 
@@ -243,6 +275,10 @@ def _wrap_sdxl_unet_forward(inner: Any) -> None:
         t_emb = timestep_embedding(timesteps, inner.model_channels, repeat_only=False).to(x.dtype)
         emb = inner.time_embed(t_emb)
 
+        if "emb_patch" in transformer_patches:
+            for patch in transformer_patches["emb_patch"]:
+                emb = patch(emb, inner.model_channels, transformer_options)
+
         if context is not None and inner.num_classes is None:
             pass
         elif inner.num_classes is not None:
@@ -264,6 +300,10 @@ def _wrap_sdxl_unet_forward(inner: Any) -> None:
                 image_only_indicator=image_only_indicator,
             )
             h = apply_control(h, control, "input")
+
+            if "input_block_patch" in transformer_patches:
+                for patch in transformer_patches["input_block_patch"]:
+                    h = patch(h, transformer_options)
 
             hs.append(h)
 
