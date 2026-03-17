@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import math
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Optional, Set, Tuple
 
 import torch
 
@@ -14,6 +14,12 @@ from .forecast import ChebyshevFeatureForecaster
 
 StreamKey = Tuple[Tuple[str, ...], Tuple[int, ...], Tuple[int, ...]]
 
+_RUN_ID_KEY = "spectrum_run_id"
+_SOLVER_STEP_ID_KEY = "spectrum_solver_step_id"
+_TIME_COORD_KEY = "spectrum_time_coord"
+_ACTUAL_FORWARD_KEY = "spectrum_actual_forward"
+_TOTAL_STEPS_KEY = "spectrum_total_steps"
+
 
 @dataclass
 class _StreamState:
@@ -21,21 +27,25 @@ class _StreamState:
 
     forecaster: ChebyshevFeatureForecaster
     curr_ws: float
+    run_id: Any = None
     num_consecutive_cached_steps: int = 0
-    decisions_by_global_step: Dict[int, Dict[str, Any]] = field(default_factory=dict)
-    observed_global_steps: Set[int] = field(default_factory=set)
+    decisions_by_solver_step: Dict[int, Dict[str, Any]] = field(default_factory=dict)
+    observed_solver_steps: Set[int] = field(default_factory=set)
     local_step_count: int = 0
-    last_global_step_idx: Optional[int] = None
 
 
 class SpectrumSDXLRuntime:
-    """Coordinate Spectrum scheduling, stream isolation, and run boundaries."""
+    """
+    Coordinate Spectrum forecasting for one explicit outer-step context.
+
+    The runtime no longer reconstructs solver steps from low-level model calls.
+    Forecasting is allowed only when the sampler/guider has already attached an
+    explicit outer-step context to ``transformer_options``.
+    """
 
     def __init__(self, cfg: SpectrumSDXLConfig):
         """Initialize the runtime and clear all run-local state."""
         self.cfg = cfg.validated()
-        self.run_id = 0
-        self._last_schedule_signature = None
         self.reset_all()
 
     def _make_forecaster(self) -> ChebyshevFeatureForecaster:
@@ -52,14 +62,8 @@ class SpectrumSDXLRuntime:
         self.stream_states: Dict[StreamKey, _StreamState] = {}
 
     def reset_all(self) -> None:
-        """Reset schedule, token, and stream state to a fresh runtime."""
-        self._last_schedule_signature = None
-        self._last_schedule_token = None
-        self._pending_schedule_token = None
-        self._sigma_to_step: Dict[float, int] = {}
-        self._ambiguous_schedule_sigmas: Set[float] = set()
-        self._step_coords: Tuple[float, ...] = ()
-        self._stream_keys_by_global_step: Dict[int, Set[StreamKey]] = {}
+        """Reset run state and fail-open guard state to a fresh runtime."""
+        self._active_run_id = None
         self._forecast_disabled = False
         self._forecast_disable_reason: Optional[str] = None
         self.reset_cycle()
@@ -70,13 +74,12 @@ class SpectrumSDXLRuntime:
             "forecasted_passes": 0,
             "actual_forward_count": 0,
             "curr_ws": float(self.cfg.window_size),
-            "last_sigma": None,
             "last_stream_key": None,
             "forecast_disabled": False,
             "forecast_disable_reason": None,
             "active_streams": 0,
             "num_steps": 0,
-            "run_id": self.run_id,
+            "run_id": None,
             "config": asdict(self.cfg),
         }
 
@@ -85,88 +88,96 @@ class SpectrumSDXLRuntime:
         self.cfg = cfg.validated()
         self.reset_all()
 
-    def _schedule_signature(self, transformer_options: Dict[str, Any]):
-        """Return a rounded value signature for the current ``sample_sigmas``."""
-        sample_sigmas = transformer_options.get("sample_sigmas", None)
-        if sample_sigmas is None:
-            return None
-        try:
-            values = sample_sigmas.detach().float().cpu().flatten().tolist()
-            return tuple(round(float(v), 8) for v in values)
-        except Exception:
-            return None
-
-    def _schedule_token(self, transformer_options: Dict[str, Any]):
-        """Return a best-effort identity token for the current ``sample_sigmas`` object."""
-        sample_sigmas = transformer_options.get("sample_sigmas", None)
-        if sample_sigmas is None:
-            return None
-        try:
-            return (
-                int(sample_sigmas.data_ptr()),
-                tuple(int(v) for v in sample_sigmas.shape),
-                str(sample_sigmas.device),
-                str(sample_sigmas.dtype),
-            )
-        except (AttributeError, TypeError, ValueError, RuntimeError):
-            return id(sample_sigmas)
-
-    def _rebuild_schedule_index(self, sig: Tuple[float, ...]) -> None:
-        """Build a sigma-to-global-step lookup for the current schedule signature."""
-        self._sigma_to_step: Dict[float, int] = {}
-        self._ambiguous_schedule_sigmas: Set[float] = set()
-        self._step_coords = tuple(float(v) for v in sig[:-1])
-        for idx, sigma in enumerate(sig[:-1]):
-            if sigma in self._ambiguous_schedule_sigmas:
-                continue
-            if sigma in self._sigma_to_step:
-                self._sigma_to_step.pop(sigma, None)
-                self._ambiguous_schedule_sigmas.add(sigma)
-                continue
-            self._sigma_to_step[sigma] = idx
-
-    def _reset_run_state(self) -> None:
+    def _reset_run_state(self, run_id: Any) -> None:
         """Reset all state scoped to one logical sampling run."""
         self.reset_cycle()
+        self._active_run_id = run_id
+        self._forecast_disabled = False
+        self._forecast_disable_reason = None
         self.last_info["forecasted_passes"] = 0
         self.last_info["actual_forward_count"] = 0
         self.last_info["curr_ws"] = float(self.cfg.window_size)
-        self.last_info["last_sigma"] = None
         self.last_info["last_stream_key"] = None
         self.last_info["forecast_disabled"] = False
         self.last_info["forecast_disable_reason"] = None
         self.last_info["active_streams"] = 0
-        self.last_info["run_id"] = self.run_id
-        self._stream_keys_by_global_step = {}
-        self._forecast_disabled = False
-        self._forecast_disable_reason = None
+        self.last_info["num_steps"] = 0
+        self.last_info["run_id"] = run_id
 
-    def _ensure_run_sync(self, transformer_options: Dict[str, Any]) -> None:
-        """Synchronize cached schedule metadata with the current sampler call."""
-        sig = self._schedule_signature(transformer_options)
-        token = self._schedule_token(transformer_options)
-        if sig is None:
-            return
-        if self._last_schedule_signature is None:
-            self._last_schedule_signature = sig
-            self._last_schedule_token = token
-            self._pending_schedule_token = None
-            self._rebuild_schedule_index(sig)
-            self.last_info["num_steps"] = max(len(sig) - 1, 1)
-            return
-        if sig != self._last_schedule_signature:
-            self.run_id += 1
-            self._last_schedule_signature = sig
-            self._last_schedule_token = token
-            self._pending_schedule_token = None
-            self._rebuild_schedule_index(sig)
-            self._reset_run_state()
-            self.last_info["num_steps"] = max(len(sig) - 1, 1)
-            return
-        if token != self._last_schedule_token:
-            self._pending_schedule_token = token
-        else:
-            self._pending_schedule_token = None
+    def _ensure_run_sync(self, run_id: Any) -> None:
+        """Reset stream state when the explicit outer run identifier changes."""
+        if self._active_run_id != run_id:
+            self._reset_run_state(run_id)
+
+    def _disable_forecasting(self, reason: str) -> None:
+        """Fail open for the current run."""
+        self._forecast_disabled = True
+        self._forecast_disable_reason = reason
+        self.last_info["forecast_disabled"] = True
+        self.last_info["forecast_disable_reason"] = reason
+
+    def _extract_total_steps(self, transformer_options: Dict[str, Any]) -> int:
+        """Return the sampler length when it is provided explicitly."""
+        raw_total_steps = transformer_options.get(_TOTAL_STEPS_KEY, None)
+        if raw_total_steps is not None:
+            try:
+                total_steps = int(raw_total_steps)
+                if total_steps >= 1:
+                    return total_steps
+            except (TypeError, ValueError):
+                pass
+
+        sample_sigmas = transformer_options.get("sample_sigmas", None)
+        if sample_sigmas is not None:
+            try:
+                return max(int(sample_sigmas.numel()) - 1, 1)
+            except Exception:
+                pass
+
+        # Detect run boundary to avoid leaking previous run's step count
+        incoming_run_id = transformer_options.get(_RUN_ID_KEY, None)
+        if incoming_run_id is not None and incoming_run_id != self._active_run_id:
+            # New run detected, don't use stale last_info
+            return 1
+
+        return max(int(self.last_info.get("num_steps", 0)), 1)
+
+    def _solver_step_context(self, transformer_options: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """Validate and extract an explicit outer-step Spectrum context."""
+        run_id = transformer_options.get(_RUN_ID_KEY, None)
+        solver_step_id = transformer_options.get(_SOLVER_STEP_ID_KEY, None)
+        time_coord = transformer_options.get(_TIME_COORD_KEY, None)
+        actual_forward = transformer_options.get(_ACTUAL_FORWARD_KEY, None)
+
+        if run_id is None and solver_step_id is None and time_coord is None and actual_forward is None:
+            return None, "missing_solver_step_context"
+        if run_id is None or solver_step_id is None or time_coord is None:
+            return None, "invalid_solver_step_context"
+
+        try:
+            solver_step_id = int(solver_step_id)
+        except (TypeError, ValueError):
+            return None, "invalid_solver_step_context"
+        if solver_step_id < 0:
+            return None, "invalid_solver_step_context"
+
+        try:
+            time_coord = float(time_coord)
+        except (TypeError, ValueError):
+            return None, "invalid_solver_step_context"
+        if not math.isfinite(time_coord):
+            return None, "invalid_solver_step_context"
+
+        if actual_forward is not None and not isinstance(actual_forward, bool):
+            return None, "invalid_solver_step_context"
+
+        return {
+            "run_id": run_id,
+            "solver_step_id": solver_step_id,
+            "time_coord": time_coord,
+            "actual_forward": actual_forward,
+            "total_steps": self._extract_total_steps(transformer_options),
+        }, None
 
     def num_steps(self) -> int:
         """Return the current sampler length in diffusion steps."""
@@ -177,12 +188,7 @@ class SpectrumSDXLRuntime:
         transformer_options: Dict[str, Any],
         input_shape: Optional[Tuple[int, ...]],
     ) -> Optional[StreamKey]:
-        """Build a stable logical stream key for the current sampler call.
-
-        ``uuids`` and ``cond_or_uncond`` identify the logical stream branch,
-        not per-item batch membership. ``input_shape`` is included only to
-        isolate incompatible tensor shapes from sharing runtime state.
-        """
+        """Build a stable logical stream key for the current sampler call."""
         if input_shape is None:
             return None
 
@@ -209,54 +215,17 @@ class SpectrumSDXLRuntime:
             return None
         return (uuid_key, cond_key, shape_key)
 
-    def sigma_key(self, transformer_options: Dict[str, Any], timesteps: torch.Tensor) -> float:
-        """Resolve the current sigma value for scheduling decisions."""
-        sigmas = transformer_options.get("sigmas", None)
-        if sigmas is not None:
-            try:
-                return round(float(sigmas.detach().flatten()[0].item()), 8)
-            except Exception:
-                pass
-        try:
-            return round(float(timesteps.detach().flatten()[0].item()), 8)
-        except Exception:
-            return 0.0
-
-    def global_step_index(self, sigma: float) -> Optional[int]:
-        """Resolve a sigma value to its cached global diffusion step index."""
-        if self._last_schedule_signature is None:
-            return None
-        if sigma in self._ambiguous_schedule_sigmas:
-            return None
-        return self._sigma_to_step.get(sigma)
-
-    def step_coord(self, global_step_idx: int) -> float:
-        """Resolve the forecast coordinate for one global diffusion step."""
-        if 0 <= int(global_step_idx) < len(self._step_coords):
-            return float(self._step_coords[int(global_step_idx)])
-        return float(global_step_idx)
-
-    def schedule_coords(self) -> Tuple[float, ...]:
-        """Return the active denoiser-step coordinate sequence."""
-        if self._step_coords:
-            return self._step_coords
-        return tuple(float(i) for i in range(self.num_steps()))
-
-    def _ensure_stream_state(self, stream_key: StreamKey) -> _StreamState:
-        """Return the existing stream state or create a fresh one."""
+    def _ensure_stream_state(self, stream_key: StreamKey, run_id: Any) -> _StreamState:
+        """Return the existing stream state or create a fresh one for this run."""
         state = self.stream_states.get(stream_key)
-        if state is None:
-            state = self._reset_stream_state(stream_key)
-        return state
-
-    def _reset_stream_state(self, stream_key: StreamKey) -> _StreamState:
-        """Replace one stream with a fresh forecaster and scheduling state."""
-        state = _StreamState(
-            forecaster=self._make_forecaster(),
-            curr_ws=float(self.cfg.window_size),
-        )
-        self.stream_states[stream_key] = state
-        self.last_info["active_streams"] = len(self.stream_states)
+        if state is None or state.run_id != run_id:
+            state = _StreamState(
+                forecaster=self._make_forecaster(),
+                curr_ws=float(self.cfg.window_size),
+                run_id=run_id,
+            )
+            self.stream_states[stream_key] = state
+            self.last_info["active_streams"] = len(self.stream_states)
         return state
 
     def begin_step(
@@ -265,131 +234,112 @@ class SpectrumSDXLRuntime:
         timesteps: torch.Tensor,
         input_shape: Optional[Tuple[int, ...]] = None,
     ) -> Dict[str, Any]:
-        """Begin or reuse tentative scheduling state for one SDXL denoiser call."""
-        self._ensure_run_sync(transformer_options)
+        """
+        Bind one model call to an already-decided outer solver step.
 
-        sigma = self.sigma_key(transformer_options, timesteps)
+        If no explicit outer-step context exists, the runtime fails open and the
+        wrapper must execute a real denoiser forward.
+        """
+        del timesteps
+
         stream_key = self.stream_key(transformer_options, input_shape)
-        global_step_idx = self.global_step_index(sigma)
-
-        self.last_info["last_sigma"] = sigma
         self.last_info["last_stream_key"] = stream_key
 
-        if stream_key is None or global_step_idx is None:
+        ctx, reason = self._solver_step_context(transformer_options)
+        if ctx is None:
+            self._disable_forecasting(reason or "invalid_solver_step_context")
             self.last_info["actual_forward_count"] += 1
             return {
-                "sigma": sigma,
-                "step_idx": global_step_idx if global_step_idx is not None else 0,
-                "global_step_idx": global_step_idx,
+                "global_step_idx": None,
+                "solver_step_id": None,
                 "local_step_count": 0,
                 "actual_forward": True,
-                "run_id": self.run_id,
+                "run_id": None,
                 "stream_key": stream_key,
                 "forecast_safe": False,
+                "finalized": False,
+                "time_coord": None,
+                "total_steps": self.num_steps(),
             }
 
-        state = None
-        if self._pending_schedule_token is not None:
-            existing_state = self.stream_states.get(stream_key)
-            existing_step_zero = existing_state is not None and (
-                0 in existing_state.decisions_by_global_step or 0 in existing_state.observed_global_steps
-            )
-            if global_step_idx == 0 and existing_step_zero:
-                self._last_schedule_token = self._pending_schedule_token
-                self._pending_schedule_token = None
-                state = self._reset_stream_state(stream_key)
-                self._stream_keys_by_global_step = {}
-                self._forecast_disabled = False
-                self._forecast_disable_reason = None
-                self.last_info["forecast_disabled"] = False
-                self.last_info["forecast_disable_reason"] = None
-            elif global_step_idx >= 0:
-                self._last_schedule_token = self._pending_schedule_token
-                self._pending_schedule_token = None
+        self._ensure_run_sync(ctx["run_id"])
+        self.last_info["num_steps"] = ctx["total_steps"]
 
-        step_streams = self._stream_keys_by_global_step.setdefault(global_step_idx, set())
-        step_streams.add(stream_key)
+        if stream_key is None:
+            self._disable_forecasting("missing_stream_identity")
+            self.last_info["actual_forward_count"] += 1
+            return {
+                "global_step_idx": ctx["solver_step_id"],
+                "solver_step_id": ctx["solver_step_id"],
+                "local_step_count": 0,
+                "actual_forward": True,
+                "run_id": ctx["run_id"],
+                "stream_key": None,
+                "forecast_safe": False,
+                "finalized": False,
+                "time_coord": ctx["time_coord"],
+                "total_steps": ctx["total_steps"],
+            }
 
-        if not self._forecast_disabled:
-            # Spectrum's SDXL path assumes one denoiser trajectory per solver step.
-            # If warmup already reveals multiple logical streams for one step, this
-            # runtime cannot forecast the same trajectory and must fail open.
-            if len(step_streams) > 1 and global_step_idx < self.cfg.warmup_steps:
-                self._forecast_disabled = True
-                self._forecast_disable_reason = "multi_stream_warmup"
-            elif global_step_idx >= self.cfg.warmup_steps:
-                for step_idx, keys in self._stream_keys_by_global_step.items():
-                    if step_idx >= self.cfg.warmup_steps:
-                        continue
-                    if len(keys) > 1:
-                        self._forecast_disabled = True
-                        self._forecast_disable_reason = "multi_stream_warmup"
-                        break
-
-        self.last_info["forecast_disabled"] = self._forecast_disabled
-        self.last_info["forecast_disable_reason"] = self._forecast_disable_reason
-
-        if state is None:
-            state = self._ensure_stream_state(stream_key)
-        if state.last_global_step_idx is not None and global_step_idx < state.last_global_step_idx:
-            # Safety net for repeated schedules without a stronger run boundary.
-            state = self._reset_stream_state(stream_key)
-        if global_step_idx in state.decisions_by_global_step:
-            decision = state.decisions_by_global_step[global_step_idx]
-            if self._forecast_disabled and not decision.get("finalized", False):
-                decision["forecast_safe"] = False
-                decision["actual_forward"] = True
+        state = self._ensure_stream_state(stream_key, ctx["run_id"])
+        existing = state.decisions_by_solver_step.get(ctx["solver_step_id"])
+        if existing is not None:
+            if self._forecast_disabled and not existing.get("finalized", False):
+                existing["forecast_safe"] = False
+                existing["actual_forward"] = True
             self.last_info["curr_ws"] = state.curr_ws
-            return decision
+            return existing
 
         local_step_count = state.local_step_count
         state.local_step_count += 1
 
-        actual_forward = True
-        if (not self._forecast_disabled) and global_step_idx >= self.cfg.warmup_steps:
-            ws_floor = max(1, math.floor(float(state.curr_ws)))
-            actual_forward = ((state.num_consecutive_cached_steps + 1) % ws_floor) == 0
-
-        if not state.forecaster.ready():
+        actual_forward = ctx["actual_forward"]
+        if actual_forward is None:
             actual_forward = True
+            if ctx["solver_step_id"] >= self.cfg.warmup_steps:
+                ws_floor = max(1, int(math.floor(state.curr_ws)))
+                actual_forward = ((state.num_consecutive_cached_steps + 1) % ws_floor) == 0
 
-        self.last_info["curr_ws"] = state.curr_ws
+        forecast_safe = not self._forecast_disabled
+        if (not actual_forward) and (not state.forecaster.ready()):
+            actual_forward = True
+            forecast_safe = False
 
         decision = {
-            "sigma": sigma,
-            "step_idx": global_step_idx,
-            "global_step_idx": global_step_idx,
+            "global_step_idx": ctx["solver_step_id"],
+            "solver_step_id": ctx["solver_step_id"],
             "local_step_count": local_step_count,
             "actual_forward": actual_forward,
-            "run_id": self.run_id,
+            "run_id": ctx["run_id"],
             "stream_key": stream_key,
-            "forecast_safe": not self._forecast_disabled,
+            "forecast_safe": forecast_safe,
             "finalized": False,
+            "time_coord": ctx["time_coord"],
+            "total_steps": ctx["total_steps"],
         }
-        state.decisions_by_global_step[global_step_idx] = decision
-        state.last_global_step_idx = global_step_idx
+        state.decisions_by_solver_step[ctx["solver_step_id"]] = decision
+        self.last_info["curr_ws"] = state.curr_ws
         return decision
 
-    def finalize_step(self, stream_key: Optional[StreamKey], global_step_idx: Optional[int], used_forecast: bool) -> None:
+    def finalize_step(self, stream_key: Optional[StreamKey], solver_step_id: Optional[int], used_forecast: bool) -> None:
         """Commit bookkeeping after the wrapper knows which path actually ran."""
-        if stream_key is None or global_step_idx is None:
+        if stream_key is None or solver_step_id is None:
             return
 
         state = self.stream_states.get(stream_key)
         if state is None:
             return
 
-        decision = state.decisions_by_global_step.get(global_step_idx)
+        decision = state.decisions_by_solver_step.get(solver_step_id)
         if decision is None or decision.get("finalized", False):
             return
 
-        local_step_count = int(decision["local_step_count"])
         if used_forecast:
             state.num_consecutive_cached_steps += 1
             self.last_info["forecasted_passes"] += 1
             decision["actual_forward"] = False
         else:
-            if global_step_idx >= self.cfg.warmup_steps:
+            if solver_step_id >= self.cfg.warmup_steps:
                 state.curr_ws = round(state.curr_ws + float(self.cfg.flex_window), 3)
             state.num_consecutive_cached_steps = 0
             self.last_info["actual_forward_count"] += 1
@@ -398,24 +348,32 @@ class SpectrumSDXLRuntime:
         decision["finalized"] = True
         self.last_info["curr_ws"] = state.curr_ws
 
-    def observe_actual_feature(self, stream_key: Optional[StreamKey], global_step_idx: Optional[int], feature: torch.Tensor) -> None:
-        """Record a real hidden feature for a stream/global-step pair once."""
-        if stream_key is None:
-            return
-        if global_step_idx is None:
+    def observe_actual_feature(self, stream_key: Optional[StreamKey], solver_step_id: Optional[int], feature: torch.Tensor) -> None:
+        """Record a real hidden feature for one explicit solver step once."""
+        if stream_key is None or solver_step_id is None:
             return
         state = self.stream_states.get(stream_key)
         if state is None:
             return
-        if global_step_idx in state.observed_global_steps:
+        if solver_step_id in state.observed_solver_steps:
             return
-        state.forecaster.update(self.step_coord(global_step_idx), feature)
-        self.finalize_step(stream_key, global_step_idx, used_forecast=False)
-        state.observed_global_steps.add(global_step_idx)
 
-    def predict_feature(self, stream_key: StreamKey, global_step_idx: int) -> torch.Tensor:
-        """Predict the hidden feature for a specific stream and global step."""
+        decision = state.decisions_by_solver_step.get(solver_step_id)
+        if decision is None:
+            return
+
+        state.forecaster.update(float(decision["time_coord"]), feature)
+        self.finalize_step(stream_key, solver_step_id, used_forecast=False)
+        state.observed_solver_steps.add(solver_step_id)
+
+    def predict_feature(self, stream_key: StreamKey, solver_step_id: int) -> torch.Tensor:
+        """Predict the hidden feature for a specific stream and solver step."""
         state = self.stream_states.get(stream_key)
         if state is None:
             raise RuntimeError("Spectrum runtime has no state for the requested stream.")
-        return state.forecaster.predict(self.step_coord(global_step_idx), self.schedule_coords())
+
+        decision = state.decisions_by_solver_step.get(int(solver_step_id))
+        if decision is None:
+            raise RuntimeError("Spectrum runtime has no decision for the requested solver step.")
+
+        return state.forecaster.predict(float(decision["time_coord"]), int(decision["total_steps"]))
