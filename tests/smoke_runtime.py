@@ -133,6 +133,161 @@ def test_cfg_streams_keep_isolated_actual_state() -> None:
     assert torch.equal(feature_b, torch.full((2, 8, 4, 4), 20.0, dtype=torch.float16))
 
 
+def test_fail_open_reconciles_unfinalized_cached_decision() -> None:
+    """Disabling forecasting must override stale unfinalized cached decisions."""
+    runtime = SpectrumSDXLRuntime(_make_cfg())
+    sample_sigmas = torch.linspace(1.0, 0.0, 6)
+
+    for i, value in enumerate((1.0, 2.0)):
+        decision = runtime.begin_step(
+            {
+                "sample_sigmas": sample_sigmas,
+                "sigmas": torch.tensor([float(sample_sigmas[i].item())]),
+                "uuids": ["stream-a"],
+                "cond_or_uncond": [0],
+            },
+            torch.tensor([float(i)]),
+            (2, 8, 4, 4),
+        )
+        runtime.observe_actual_feature(
+            decision["stream_key"],
+            decision["global_step_idx"],
+            torch.full((2, 8, 4, 4), value, dtype=torch.float16),
+        )
+
+    forecast_candidate = runtime.begin_step(
+        {
+            "sample_sigmas": sample_sigmas,
+            "sigmas": torch.tensor([float(sample_sigmas[2].item())]),
+            "uuids": ["stream-a"],
+            "cond_or_uncond": [0],
+        },
+        torch.tensor([2.0]),
+        (2, 8, 4, 4),
+    )
+    assert forecast_candidate["actual_forward"] is False
+    assert forecast_candidate["forecast_safe"] is True
+    assert forecast_candidate["finalized"] is False
+
+    warmup_other_stream = runtime.begin_step(
+        {
+            "sample_sigmas": sample_sigmas,
+            "sigmas": torch.tensor([float(sample_sigmas[0].item())]),
+            "uuids": ["stream-b"],
+            "cond_or_uncond": [1],
+        },
+        torch.tensor([0.0]),
+        (2, 8, 4, 4),
+    )
+    assert runtime.last_info["forecast_disabled"] is True
+    assert runtime.last_info["forecast_disable_reason"] == "multi_stream_warmup"
+    assert warmup_other_stream["actual_forward"] is True
+
+    retried = runtime.begin_step(
+        {
+            "sample_sigmas": sample_sigmas,
+            "sigmas": torch.tensor([float(sample_sigmas[2].item())]),
+            "uuids": ["stream-a"],
+            "cond_or_uncond": [0],
+        },
+        torch.tensor([2.0]),
+        (2, 8, 4, 4),
+    )
+    assert retried is forecast_candidate
+    assert retried["forecast_safe"] is False
+    assert retried["actual_forward"] is True
+    assert retried["finalized"] is False
+
+
+def test_same_signature_restart_clears_stale_multistream_guard() -> None:
+    """A same-signature step-0 restart must clear stale run-scoped warmup layout state."""
+    runtime = SpectrumSDXLRuntime(_make_cfg())
+    sample_sigmas_a = torch.linspace(1.0, 0.0, 6)
+    sample_sigmas_b = torch.linspace(1.0, 0.0, 6)
+    sample_sigmas_c = torch.linspace(1.0, 0.0, 6)
+
+    first_a = runtime.begin_step(
+        {
+            "sample_sigmas": sample_sigmas_a,
+            "sigmas": torch.tensor([float(sample_sigmas_a[0].item())]),
+            "uuids": ["stream-a"],
+            "cond_or_uncond": [0],
+        },
+        torch.tensor([0.0]),
+        (2, 8, 4, 4),
+    )
+    runtime.observe_actual_feature(
+        first_a["stream_key"],
+        first_a["global_step_idx"],
+        torch.full((2, 8, 4, 4), 1.0, dtype=torch.float16),
+    )
+
+    first_b = runtime.begin_step(
+        {
+            "sample_sigmas": sample_sigmas_b,
+            "sigmas": torch.tensor([float(sample_sigmas_b[0].item())]),
+            "uuids": ["stream-b"],
+            "cond_or_uncond": [1],
+        },
+        torch.tensor([0.0]),
+        (2, 8, 4, 4),
+    )
+    runtime.observe_actual_feature(
+        first_b["stream_key"],
+        first_b["global_step_idx"],
+        torch.full((2, 8, 4, 4), 2.0, dtype=torch.float16),
+    )
+
+    restarted_a = runtime.begin_step(
+        {
+            "sample_sigmas": sample_sigmas_c,
+            "sigmas": torch.tensor([float(sample_sigmas_c[0].item())]),
+            "uuids": ["stream-a"],
+            "cond_or_uncond": [0],
+        },
+        torch.tensor([0.0]),
+        (2, 8, 4, 4),
+    )
+    assert runtime.last_info["forecast_disabled"] is False
+    assert runtime.last_info["forecast_disable_reason"] is None
+    runtime.observe_actual_feature(
+        restarted_a["stream_key"],
+        restarted_a["global_step_idx"],
+        torch.full((2, 8, 4, 4), 3.0, dtype=torch.float16),
+    )
+
+    step1 = runtime.begin_step(
+        {
+            "sample_sigmas": sample_sigmas_c,
+            "sigmas": torch.tensor([float(sample_sigmas_c[1].item())]),
+            "uuids": ["stream-a"],
+            "cond_or_uncond": [0],
+        },
+        torch.tensor([1.0]),
+        (2, 8, 4, 4),
+    )
+    runtime.observe_actual_feature(
+        step1["stream_key"],
+        step1["global_step_idx"],
+        torch.full((2, 8, 4, 4), 4.0, dtype=torch.float16),
+    )
+
+    step2 = runtime.begin_step(
+        {
+            "sample_sigmas": sample_sigmas_c,
+            "sigmas": torch.tensor([float(sample_sigmas_c[2].item())]),
+            "uuids": ["stream-a"],
+            "cond_or_uncond": [0],
+        },
+        torch.tensor([2.0]),
+        (2, 8, 4, 4),
+    )
+    assert runtime.last_info["forecast_disabled"] is False
+    assert runtime.last_info["forecast_disable_reason"] is None
+    assert step2["forecast_safe"] is True
+    assert step2["actual_forward"] is False
+
+
 def test_duplicate_actual_updates_are_deduped() -> None:
     """A repeated actual write for one stream/step must only be recorded once."""
     runtime = SpectrumSDXLRuntime(_make_cfg())
@@ -610,6 +765,8 @@ def main() -> None:
     test_single_stream_forecasts()
     test_multi_stream_warmup_disables_forecasting()
     test_cfg_streams_keep_isolated_actual_state()
+    test_fail_open_reconciles_unfinalized_cached_decision()
+    test_same_signature_restart_clears_stale_multistream_guard()
     test_duplicate_actual_updates_are_deduped()
     test_forecast_fallback_commits_actual_bookkeeping()
     test_observe_retry_after_update_failure()

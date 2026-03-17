@@ -274,6 +274,25 @@ class SpectrumSDXLRuntime:
                 "forecast_safe": False,
             }
 
+        state = None
+        if self._pending_schedule_token is not None:
+            existing_state = self.stream_states.get(stream_key)
+            existing_step_zero = existing_state is not None and (
+                0 in existing_state.decisions_by_global_step or 0 in existing_state.observed_global_steps
+            )
+            if global_step_idx == 0 and existing_step_zero:
+                self._last_schedule_token = self._pending_schedule_token
+                self._pending_schedule_token = None
+                state = self._reset_stream_state(stream_key)
+                self._stream_keys_by_global_step = {}
+                self._forecast_disabled = False
+                self._forecast_disable_reason = None
+                self.last_info["forecast_disabled"] = False
+                self.last_info["forecast_disable_reason"] = None
+            elif global_step_idx >= 0:
+                self._last_schedule_token = self._pending_schedule_token
+                self._pending_schedule_token = None
+
         step_streams = self._stream_keys_by_global_step.setdefault(global_step_idx, set())
         step_streams.add(stream_key)
 
@@ -296,20 +315,6 @@ class SpectrumSDXLRuntime:
         self.last_info["forecast_disabled"] = self._forecast_disabled
         self.last_info["forecast_disable_reason"] = self._forecast_disable_reason
 
-        state = None
-        if self._pending_schedule_token is not None:
-            existing_state = self.stream_states.get(stream_key)
-            existing_step_zero = existing_state is not None and (
-                0 in existing_state.decisions_by_global_step or 0 in existing_state.observed_global_steps
-            )
-            if global_step_idx == 0 and existing_step_zero:
-                self._last_schedule_token = self._pending_schedule_token
-                self._pending_schedule_token = None
-                state = self._reset_stream_state(stream_key)
-            elif global_step_idx >= 0:
-                self._last_schedule_token = self._pending_schedule_token
-                self._pending_schedule_token = None
-
         if state is None:
             state = self._ensure_stream_state(stream_key)
         if state.last_global_step_idx is not None and global_step_idx < state.last_global_step_idx:
@@ -317,6 +322,9 @@ class SpectrumSDXLRuntime:
             state = self._reset_stream_state(stream_key)
         if global_step_idx in state.decisions_by_global_step:
             decision = state.decisions_by_global_step[global_step_idx]
+            if self._forecast_disabled and not decision.get("finalized", False):
+                decision["forecast_safe"] = False
+                decision["actual_forward"] = True
             self.last_info["curr_ws"] = state.curr_ws
             return decision
 
