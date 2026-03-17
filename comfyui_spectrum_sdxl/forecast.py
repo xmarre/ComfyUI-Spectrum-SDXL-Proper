@@ -10,12 +10,12 @@ import torch
 
 @dataclass
 class _FitCache:
-    """Cached regression fit for a fixed sampler length."""
+    """Cached regression fit for a fixed schedule coordinate sequence."""
 
     coeff: torch.Tensor
     feature_shape: torch.Size
     feature_dtype: torch.dtype
-    total_steps: int
+    schedule_coords: Tuple[float, ...]
 
 
 class ChebyshevFeatureForecaster:
@@ -24,8 +24,8 @@ class ChebyshevFeatureForecaster:
 
     The predictor fits a Chebyshev basis with ridge regularization over
     observed hidden features, then blends that forecast with a local
-    first-order extrapolation. Time is normalized against the current sampler
-    length rather than a hard-coded 50-step schedule.
+    first-order extrapolation. Time is normalized against the current denoiser
+    schedule coordinates rather than ordinal step indices.
     """
 
     def __init__(self, degree: int, ridge_lambda: float, blend_weight: float, history_size: int = 100):
@@ -81,9 +81,10 @@ class ChebyshevFeatureForecaster:
             cols.append(2.0 * taus.to(torch.float32) * cols[-1] - cols[-2])
         return torch.cat(cols[: degree + 1], dim=1)
 
-    def _fit_if_needed(self, total_steps: int) -> None:
+    def _fit_if_needed(self, schedule_coords: Tuple[float, ...]) -> None:
         """Fit ridge-regression coefficients if the cache is stale."""
-        if self._fit_cache is not None and self._fit_cache.total_steps == int(total_steps):
+        cached_coords = tuple(float(v) for v in schedule_coords)
+        if self._fit_cache is not None and self._fit_cache.schedule_coords == cached_coords:
             return
         if not self.history:
             raise RuntimeError("Spectrum forecaster was asked to fit without history.")
@@ -114,7 +115,7 @@ class ChebyshevFeatureForecaster:
             coeff=coeff,
             feature_shape=self._feature_shape,
             feature_dtype=self._feature_dtype,
-            total_steps=int(total_steps),
+            schedule_coords=cached_coords,
         )
 
     def _predict_chebyshev(self, time_coord: float, total_steps: int) -> torch.Tensor:
@@ -131,12 +132,11 @@ class ChebyshevFeatureForecaster:
     def _predict_linear(self, time_coord: float) -> torch.Tensor:
         """Predict a feature using local first-order extrapolation."""
         assert self.history
-        _, last_feat = self.history[-1]
+        last_coord, last_feat = self.history[-1]
         if len(self.history) < 2:
             return last_feat.to(torch.float32)
 
-        prev_step, prev_feat = self.history[-2]
-        last_step, last_feat = self.history[-1]
+        prev_coord, prev_feat = self.history[-2]
         prev_feat = prev_feat.to(torch.float32)
         last_feat = last_feat.to(torch.float32)
 
