@@ -38,7 +38,7 @@ class ChebyshevFeatureForecaster:
 
     def reset(self) -> None:
         """Clear observed features and any cached regression fit."""
-        self.history: List[Tuple[int, torch.Tensor]] = []
+        self.history: List[Tuple[float, torch.Tensor]] = []
         self._feature_shape: Optional[torch.Size] = None
         self._feature_dtype: Optional[torch.dtype] = None
         self._feature_device: Optional[torch.device] = None
@@ -48,8 +48,8 @@ class ChebyshevFeatureForecaster:
         """Return whether enough history exists to attempt a forecast."""
         return len(self.history) >= 2
 
-    def update(self, step_idx: int, feature: torch.Tensor) -> None:
-        """Append an observed feature for one global diffusion step."""
+    def update(self, time_coord: float, feature: torch.Tensor) -> None:
+        """Append an observed feature for one solver-step time coordinate."""
         feat = feature.detach()
         if self._feature_shape is None:
             self._feature_shape = feat.shape
@@ -61,15 +61,15 @@ class ChebyshevFeatureForecaster:
             self._feature_dtype = feat.dtype
             self._feature_device = feat.device
 
-        self.history.append((int(step_idx), feat))
+        self.history.append((float(time_coord), feat))
         if len(self.history) > self.history_size:
             self.history.pop(0)
         self._fit_cache = None
 
-    def _tau(self, step_values: torch.Tensor, total_steps: int) -> torch.Tensor:
-        """Map discrete step indices to the Chebyshev domain ``[-1, 1]``."""
+    def _tau(self, time_values: torch.Tensor, total_steps: int) -> torch.Tensor:
+        """Map solver-step coordinates to the Chebyshev domain ``[-1, 1]``."""
         denom = max(int(total_steps) - 1, 1)
-        return (step_values / float(denom)) * 2.0 - 1.0
+        return (time_values / float(denom)) * 2.0 - 1.0
 
     def _design(self, taus: torch.Tensor, degree: int) -> torch.Tensor:
         """Construct the Chebyshev design matrix up to the requested degree."""
@@ -92,8 +92,8 @@ class ChebyshevFeatureForecaster:
         assert self._feature_device is not None
 
         device = self._feature_device
-        step_tensor = torch.tensor([s for s, _ in self.history], device=device, dtype=torch.float32)
-        taus = self._tau(step_tensor, total_steps)
+        time_tensor = torch.tensor([t for t, _ in self.history], device=device, dtype=torch.float32)
+        taus = self._tau(time_tensor, total_steps)
         x_mat = self._design(taus, self.degree)
         h_mat = torch.stack([feat.reshape(-1).to(torch.float32) for _, feat in self.history], dim=0)
 
@@ -117,18 +117,18 @@ class ChebyshevFeatureForecaster:
             total_steps=int(total_steps),
         )
 
-    def _predict_chebyshev(self, step_idx: int, total_steps: int) -> torch.Tensor:
+    def _predict_chebyshev(self, time_coord: float, total_steps: int) -> torch.Tensor:
         """Predict a feature using only the fitted Chebyshev basis."""
         assert self._fit_cache is not None
         tau_star = self._tau(
-            torch.tensor([int(step_idx)], device=self._fit_cache.coeff.device, dtype=torch.float32),
+            torch.tensor([float(time_coord)], device=self._fit_cache.coeff.device, dtype=torch.float32),
             total_steps,
         )
         x_star = self._design(tau_star, self.degree)
         pred = (x_star @ self._fit_cache.coeff).reshape(self._fit_cache.feature_shape)
         return pred
 
-    def _predict_linear(self, step_idx: int) -> torch.Tensor:
+    def _predict_linear(self, time_coord: float) -> torch.Tensor:
         """Predict a feature using local first-order extrapolation."""
         assert self.history
         _, last_feat = self.history[-1]
@@ -140,20 +140,20 @@ class ChebyshevFeatureForecaster:
         prev_feat = prev_feat.to(torch.float32)
         last_feat = last_feat.to(torch.float32)
 
-        dt = max(float(last_step - prev_step), 1.0)
-        k = (float(step_idx) - float(last_step)) / dt
+        dt = max(float(last_step - prev_step), 1e-6)
+        k = (float(time_coord) - float(last_step)) / dt
         return last_feat + k * (last_feat - prev_feat)
 
-    def predict(self, step_idx: int, total_steps: int) -> torch.Tensor:
-        """Predict the hidden feature for a future global diffusion step."""
+    def predict(self, time_coord: float, total_steps: int) -> torch.Tensor:
+        """Predict the hidden feature for a future solver-step coordinate."""
         if not self.history:
             raise RuntimeError("Spectrum forecaster was asked to predict without history.")
         if len(self.history) == 1:
             return self.history[-1][1]
 
         self._fit_if_needed(total_steps)
-        cheb = self._predict_chebyshev(step_idx, total_steps)
-        lin = self._predict_linear(step_idx)
+        cheb = self._predict_chebyshev(time_coord, total_steps)
+        lin = self._predict_linear(time_coord)
         out = (1.0 - self.blend_weight) * lin + self.blend_weight * cheb
 
         latest = self.history[-1][1]

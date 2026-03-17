@@ -14,6 +14,12 @@ _RUNTIME_KEY = "spectrum_sdxl_runtime"
 _CFG_KEY = "spectrum_sdxl_cfg"
 _ENABLED_KEY = "spectrum_sdxl_enabled"
 _BACKEND_KEY = "spectrum_backend"
+_OUTER_STEP_CONTROLLER_KEY = "spectrum_sdxl_outer_step_controller"
+
+_RUN_ID_KEY = "spectrum_run_id"
+_SOLVER_STEP_ID_KEY = "spectrum_solver_step_id"
+_TIME_COORD_KEY = "spectrum_time_coord"
+_TOTAL_STEPS_KEY = "spectrum_total_steps"
 
 
 def _clone_model(model: Any) -> Any:
@@ -66,6 +72,93 @@ def _resolve_runtime(transformer_options: Dict[str, Any]) -> Optional[SpectrumSD
     return None
 
 
+class _SpectrumOuterStepController:
+    """Attach stable outer solver-step context before ComfyUI evaluates conditions."""
+
+    def __init__(self, runtime: SpectrumSDXLRuntime, delegate=None):
+        self.runtime = runtime
+        self.delegate = delegate
+        self._current_run_token = None
+        self._run_serial = 0
+        self._next_solver_step_id = 0
+
+    def _extract_time_coord(self, transformer_options: Dict[str, Any]) -> float:
+        """Keep the forecast axis aligned with the ordinal outer-step index."""
+        del transformer_options
+        return float(self._next_solver_step_id)
+
+    def _sample_sigmas_token(self, transformer_options: Dict[str, Any]):
+        sample_sigmas = transformer_options.get("sample_sigmas", None)
+        if sample_sigmas is None:
+            return None
+        try:
+            return (
+                int(sample_sigmas.data_ptr()),
+                tuple(int(v) for v in sample_sigmas.shape),
+                str(sample_sigmas.device),
+                str(sample_sigmas.dtype),
+            )
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            return ("id", id(sample_sigmas))
+
+    def _extract_total_steps(self, transformer_options: Dict[str, Any]) -> int:
+        sample_sigmas = transformer_options.get("sample_sigmas", None)
+        if sample_sigmas is not None:
+            try:
+                return max(int(sample_sigmas.numel()) - 1, 1)
+            except Exception:
+                pass
+        return max(int(self.runtime.last_info.get("num_steps", 0)), 1)
+
+    def _ensure_outer_step_context(self, args: Dict[str, Any]) -> None:
+        model_options = args["model_options"]
+        transformer_options = model_options.setdefault("transformer_options", {})
+        run_token = self._sample_sigmas_token(transformer_options)
+        if run_token is None:
+            run_token = ("model_options", id(model_options))
+        if run_token != self._current_run_token:
+            self._current_run_token = run_token
+            self._run_serial += 1
+            self._next_solver_step_id = 0
+
+        transformer_options[_RUN_ID_KEY] = self._run_serial
+        transformer_options[_SOLVER_STEP_ID_KEY] = self._next_solver_step_id
+        transformer_options[_TIME_COORD_KEY] = self._extract_time_coord(transformer_options)
+        transformer_options[_TOTAL_STEPS_KEY] = self._extract_total_steps(transformer_options)
+        self._next_solver_step_id += 1
+
+    def __call__(self, args):
+        model_options = args["model_options"]
+        self._ensure_outer_step_context(args)
+        if self.delegate is not None:
+            return self.delegate(args)
+
+        import comfy.samplers
+
+        return comfy.samplers.calc_cond_batch(
+            args["model"],
+            args["conds"],
+            args["input"],
+            args["sigma"],
+            model_options,
+        )
+
+
+def _install_outer_step_controller(model: Any, runtime: SpectrumSDXLRuntime) -> None:
+    """Install the sampler-layer outer-step controller on the patched model."""
+    model_options = _ensure_model_options(model)
+    controller = model_options.get(_OUTER_STEP_CONTROLLER_KEY)
+    if isinstance(controller, _SpectrumOuterStepController):
+        controller.runtime = runtime
+        model_options["sampler_calc_cond_batch_function"] = controller
+        return
+
+    previous = model_options.get("sampler_calc_cond_batch_function")
+    controller = _SpectrumOuterStepController(runtime=runtime, delegate=previous)
+    model_options[_OUTER_STEP_CONTROLLER_KEY] = controller
+    model_options["sampler_calc_cond_batch_function"] = controller
+
+
 def _wrap_sdxl_unet_forward(inner: Any) -> None:
     """Install the Spectrum-aware wrapper around the native SDXL ``_forward``."""
     if getattr(inner, "_spectrum_sdxl_wrapped", False):
@@ -82,7 +175,7 @@ def _wrap_sdxl_unet_forward(inner: Any) -> None:
         transformer_options={},
         **kwargs,
     ):
-        """Run one SDXL denoiser call with Spectrum scheduling."""
+        """Run one SDXL denoiser call with explicit outer-step Spectrum context."""
         runtime = _resolve_runtime(transformer_options)
         if runtime is None or not runtime.cfg.enabled:
             return original_forward(x, timesteps, context, y, control, transformer_options, **kwargs)
@@ -90,7 +183,6 @@ def _wrap_sdxl_unet_forward(inner: Any) -> None:
         if transformer_options is None:
             transformer_options = {}
 
-        # Lazy imports keep the repository importable outside a ComfyUI runtime.
         from comfy.ldm.modules.diffusionmodules.openaimodel import (
             apply_control,
             forward_timestep_embed,
@@ -99,7 +191,7 @@ def _wrap_sdxl_unet_forward(inner: Any) -> None:
         import torch as th
 
         decision = runtime.begin_step(transformer_options, timesteps, tuple(int(v) for v in x.shape))
-        global_step_idx = decision["global_step_idx"]
+        solver_step_id = decision["solver_step_id"]
         actual_forward = decision["actual_forward"]
         stream_key = decision["stream_key"]
 
@@ -108,7 +200,7 @@ def _wrap_sdxl_unet_forward(inner: Any) -> None:
 
         if not actual_forward:
             try:
-                predicted_h = runtime.predict_feature(stream_key, global_step_idx)
+                predicted_h = runtime.predict_feature(stream_key, solver_step_id)
             except Exception:
                 predicted_h = None
 
@@ -118,30 +210,28 @@ def _wrap_sdxl_unet_forward(inner: Any) -> None:
                     predicted_h = None
 
             if predicted_h is not None:
-                runtime.finalize_step(stream_key, global_step_idx, used_forecast=True)
+                runtime.finalize_step(stream_key, solver_step_id, used_forecast=True)
                 if getattr(inner, "predict_codebook_ids", False):
                     return inner.id_predictor(predicted_h)
                 return inner.out(predicted_h)
 
         transformer_patches = transformer_options.get("patches", {})
-        num_video_frames = kwargs.get("num_video_frames", getattr(inner, "default_num_video_frames", 1))
-        image_only_indicator = kwargs.get("image_only_indicator", None)
-        time_context = kwargs.get("time_context", None)
-
-        assert (y is not None) == (inner.num_classes is not None), (
-            "must specify y if and only if the model is class-conditional"
+        num_video_frames = kwargs.get("num_video_frames", transformer_options.get("num_video_frames", 1))
+        image_only_indicator = kwargs.get(
+            "image_only_indicator",
+            transformer_options.get("image_only_indicator", None),
         )
+        time_context = kwargs.get("time_context", None)
 
         hs = []
         t_emb = timestep_embedding(timesteps, inner.model_channels, repeat_only=False).to(x.dtype)
         emb = inner.time_embed(t_emb)
 
-        if "emb_patch" in transformer_patches:
-            for patch in transformer_patches["emb_patch"]:
-                emb = patch(emb, inner.model_channels, transformer_options)
-
-        if inner.num_classes is not None:
-            assert y.shape[0] == x.shape[0]
+        if context is not None and inner.num_classes is None:
+            pass
+        elif inner.num_classes is not None:
+            if y is None:
+                raise ValueError("ComfyUI Spectrum SDXL patch expected class labels for a class-conditional model.")
             emb = emb + inner.label_emb(y)
 
         h = x
@@ -158,10 +248,6 @@ def _wrap_sdxl_unet_forward(inner: Any) -> None:
                 image_only_indicator=image_only_indicator,
             )
             h = apply_control(h, control, "input")
-
-            if "input_block_patch" in transformer_patches:
-                for patch in transformer_patches["input_block_patch"]:
-                    h = patch(h, transformer_options)
 
             hs.append(h)
 
@@ -209,7 +295,7 @@ def _wrap_sdxl_unet_forward(inner: Any) -> None:
             )
 
         h = h.type(x.dtype)
-        runtime.observe_actual_feature(stream_key, global_step_idx, h)
+        runtime.observe_actual_feature(stream_key, solver_step_id, h)
 
         if getattr(inner, "predict_codebook_ids", False):
             return inner.id_predictor(h)
@@ -241,6 +327,8 @@ class SDXLSpectrumPatcher:
         tr_opts[_ENABLED_KEY] = cfg.enabled
         tr_opts[_BACKEND_KEY] = "sdxl_native"
         tr_opts["spectrum_sdxl_cfg_dict"] = asdict(cfg)
+
+        _install_outer_step_controller(patched, runtime)
 
         inner, inner_name = _locate_unet_inner_model(patched)
         runtime.last_info["hook_target"] = inner_name
