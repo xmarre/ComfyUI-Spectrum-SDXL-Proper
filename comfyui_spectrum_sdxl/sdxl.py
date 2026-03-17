@@ -82,25 +82,9 @@ class _SpectrumOuterStepController:
         self._run_serial = 0
         self._next_solver_step_id = 0
 
-    def _extract_time_coord(self, transformer_options: Dict[str, Any], args: Dict[str, Any]) -> float:
-        """Extract the raw sigma value to use as the time coordinate."""
-        # Try to get sigma from args first
-        sigma = args.get("sigma", None)
-        if sigma is not None:
-            try:
-                return float(sigma.item() if hasattr(sigma, "item") else sigma)
-            except (AttributeError, TypeError, ValueError):
-                pass
-
-        # Fallback to transformer_options if available
-        sigma = transformer_options.get("sigma", None)
-        if sigma is not None:
-            try:
-                return float(sigma.item() if hasattr(sigma, "item") else sigma)
-            except (AttributeError, TypeError, ValueError):
-                pass
-
-        # Last resort: return step id (for backwards compatibility)
+    def _extract_time_coord(self, transformer_options: Dict[str, Any]) -> float:
+        """Keep the forecast axis aligned with the ordinal outer-step index."""
+        del transformer_options
         return float(self._next_solver_step_id)
 
     def _sample_sigmas_token(self, transformer_options: Dict[str, Any]):
@@ -171,7 +155,7 @@ class _SpectrumOuterStepController:
 
         transformer_options[_RUN_ID_KEY] = self._run_serial
         transformer_options[_SOLVER_STEP_ID_KEY] = self._next_solver_step_id
-        transformer_options[_TIME_COORD_KEY] = self._extract_time_coord(transformer_options, args)
+        transformer_options[_TIME_COORD_KEY] = self._extract_time_coord(transformer_options)
         transformer_options[_TOTAL_STEPS_KEY] = self._extract_total_steps(transformer_options)
         self._next_solver_step_id += 1
 

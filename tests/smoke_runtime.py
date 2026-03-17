@@ -199,7 +199,7 @@ def test_outer_step_controller_same_object_restart_resets_run_state() -> None:
 
 
 def test_outer_step_controller_uses_ordinal_time_coord() -> None:
-    """The controller must provide time_coord as raw sigma values (sigma-space)."""
+    """The controller must keep time_coord in the same ordinal step space as the forecaster."""
     runtime = SpectrumSDXLRuntime(_make_cfg())
     controller = _SpectrumOuterStepController(
         runtime=runtime,
@@ -217,8 +217,8 @@ def test_outer_step_controller_uses_ordinal_time_coord() -> None:
 
     assert first["spectrum_solver_step_id"] == 0
     assert second["spectrum_solver_step_id"] == 1
-    assert first["spectrum_time_coord"] == 14.0
-    assert second["spectrum_time_coord"] == 7.0
+    assert first["spectrum_time_coord"] == 0.0
+    assert second["spectrum_time_coord"] == 1.0
 
 
 def test_forecast_request_before_history_fails_open_per_step() -> None:
