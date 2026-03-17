@@ -68,8 +68,10 @@ class ChebyshevFeatureForecaster:
 
     def _tau(self, time_values: torch.Tensor, total_steps: int) -> torch.Tensor:
         """Map solver-step coordinates to the Chebyshev domain ``[-1, 1]``."""
-        denom = max(int(total_steps) - 1, 1)
-        return (time_values / float(denom)) * 2.0 - 1.0
+        t_min = time_values.min()
+        t_max = time_values.max()
+        eps = torch.tensor(1e-8, dtype=time_values.dtype, device=time_values.device)
+        return (time_values - t_min) / (t_max - t_min + eps) * 2.0 - 1.0
 
     def _design(self, taus: torch.Tensor, degree: int) -> torch.Tensor:
         """Construct the Chebyshev design matrix up to the requested degree."""
@@ -94,7 +96,7 @@ class ChebyshevFeatureForecaster:
 
         device = self._feature_device
         time_tensor = torch.tensor([t for t, _ in self.history], device=device, dtype=torch.float32)
-        taus = self._tau(time_tensor, total_steps)
+        taus = self._tau(time_tensor, 0)
         x_mat = self._design(taus, self.degree)
         h_mat = torch.stack([feat.reshape(-1).to(torch.float32) for _, feat in self.history], dim=0)
 
@@ -123,7 +125,7 @@ class ChebyshevFeatureForecaster:
         assert self._fit_cache is not None
         tau_star = self._tau(
             torch.tensor([float(time_coord)], device=self._fit_cache.coeff.device, dtype=torch.float32),
-            total_steps,
+            0,
         )
         x_star = self._design(tau_star, self.degree)
         pred = (x_star @ self._fit_cache.coeff).reshape(self._fit_cache.feature_shape)
@@ -140,8 +142,8 @@ class ChebyshevFeatureForecaster:
         prev_feat = prev_feat.to(torch.float32)
         last_feat = last_feat.to(torch.float32)
 
-        dt = max(float(last_step - prev_step), 1e-6)
-        k = (float(time_coord) - float(last_step)) / dt
+        dt = max(float(last_coord - prev_coord), 1e-6)
+        k = (float(time_coord) - float(last_coord)) / dt
         return last_feat + k * (last_feat - prev_feat)
 
     def predict(self, time_coord: float, total_steps: int) -> torch.Tensor:

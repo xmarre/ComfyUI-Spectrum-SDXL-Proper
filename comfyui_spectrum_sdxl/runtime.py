@@ -101,6 +101,7 @@ class SpectrumSDXLRuntime:
         self.last_info["forecast_disabled"] = False
         self.last_info["forecast_disable_reason"] = None
         self.last_info["active_streams"] = 0
+        self.last_info["num_steps"] = 0
         self.last_info["run_id"] = run_id
 
     def _ensure_run_sync(self, run_id: Any) -> None:
@@ -132,6 +133,12 @@ class SpectrumSDXLRuntime:
                 return max(int(sample_sigmas.numel()) - 1, 1)
             except Exception:
                 pass
+
+        # Detect run boundary to avoid leaking previous run's step count
+        incoming_run_id = transformer_options.get(_RUN_ID_KEY, None)
+        if incoming_run_id is not None and incoming_run_id != self._active_run_id:
+            # New run detected, don't use stale last_info
+            return 1
 
         return max(int(self.last_info.get("num_steps", 0)), 1)
 

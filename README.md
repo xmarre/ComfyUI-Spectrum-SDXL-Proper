@@ -13,16 +13,16 @@ Spectrum's scheduling invariant lives at the outer solver-step level, not inside
 
 Required outer-step keys:
 
-- `spectrum_run_id`
-- `spectrum_solver_step_id`
-- `spectrum_time_coord`
+- `spectrum_run_id` - unique identifier for the current sampling run
+- `spectrum_solver_step_id` - ordinal solver step index (0, 1, 2, ...)
+- `spectrum_time_coord` - raw sigma value (sigma-space coordinate)
 
 Optional key:
 
-- `spectrum_actual_forward`
-- `spectrum_total_steps`
+- `spectrum_actual_forward` - explicit per-step decision override
+- `spectrum_total_steps` - total number of diffusion steps
 
-The built-in outer-step controller injects `run_id`, `solver_step_id`, `time_coord`, and `total_steps` automatically for normal ComfyUI sampling. In the current implementation, `time_coord` is the same ordinal outer-step index used by the forecaster, not the raw sigma value. `spectrum_actual_forward` can still be supplied by an external controller if it wants to force the per-step decision explicitly.
+The built-in outer-step controller injects `run_id`, `solver_step_id`, `time_coord`, and `total_steps` automatically for normal ComfyUI sampling. The `time_coord` represents the raw sigma value from the noise schedule, not an ordinal step index. External controllers should supply raw sigma values in `spectrum_time_coord` to maintain compatibility with the sigma-space forecasting coordinate system. `spectrum_actual_forward` can still be supplied by an external controller if it wants to force the per-step decision explicitly.
 
 ## What the model hook does
 
@@ -71,12 +71,12 @@ For normal ComfyUI sampling, the node installs its own outer-step controller and
 
 - Forecast target: the final hidden U-Net feature before `self.out(h)`
 - Forecast history: populated only from actual forwards
-- Forecast coordinate: `spectrum_time_coord` in ordinal outer-step space
-- Step identity: `spectrum_solver_step_id`
+- Forecast coordinate: `spectrum_time_coord` in sigma-space (raw sigma values)
+- Step identity: `spectrum_solver_step_id` (ordinal step index)
 - Run boundary: `spectrum_run_id`
 - Stream isolation: `uuids` + `cond_or_uncond` + input shape
 
-The runtime may still use `sample_sigmas` length as a fallback for normalization when `spectrum_total_steps` is absent, but it does not use sigma values to decide solver steps or forecast eligibility. Raw sigma-space forecasting is not implemented in this tree.
+The forecaster normalizes sigma values to the Chebyshev domain using the actual min/max range of observed sigma coordinates. This allows the predictor to correctly handle arbitrary continuous sigma schedules without assuming ordinal step spacing. The runtime uses `sample_sigmas` length as a fallback for `spectrum_total_steps` when not explicitly provided.
 
 ## Smoke test
 
