@@ -165,7 +165,12 @@ class SpectrumSDXLRuntime:
         transformer_options: Dict[str, Any],
         input_shape: Optional[Tuple[int, ...]],
     ) -> Optional[StreamKey]:
-        """Build a stable logical stream key for the current sampler call."""
+        """Build a stable logical stream key for the current sampler call.
+
+        ``uuids`` and ``cond_or_uncond`` identify the logical stream branch,
+        not per-item batch membership. ``input_shape`` is included only to
+        isolate incompatible tensor shapes from sharing runtime state.
+        """
         if input_shape is None:
             return None
 
@@ -175,13 +180,20 @@ class SpectrumSDXLRuntime:
             return None
 
         try:
-            uuid_key = tuple(str(u) for u in uuids)
+            raw_uuid_key = tuple(uuids)
+            if any(u is None for u in raw_uuid_key):
+                return None
+            uuid_key = tuple(str(u) for u in raw_uuid_key)
             cond_key = tuple(int(v) for v in cond_or_uncond)
             shape_key = tuple(int(v) for v in input_shape)
         except (TypeError, ValueError):
             return None
 
-        if not shape_key or (not uuid_key and not cond_key):
+        if not shape_key:
+            return None
+        if not uuid_key or not cond_key:
+            return None
+        if len(uuid_key) != len(cond_key):
             return None
         return (uuid_key, cond_key, shape_key)
 

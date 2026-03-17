@@ -509,6 +509,46 @@ def test_missing_stream_identity_fails_open() -> None:
     assert decision["stream_key"] is None
 
 
+def test_malformed_stream_identity_fails_open() -> None:
+    """Partially invalid stream metadata must not produce a cacheable stream key."""
+    runtime = SpectrumSDXLRuntime(_make_cfg())
+    sample_sigmas = torch.linspace(1.0, 0.0, 4)
+
+    decision = runtime.begin_step(
+        {
+            "sample_sigmas": sample_sigmas,
+            "sigmas": torch.tensor([1.0]),
+            "uuids": ["stream-a"],
+            "cond_or_uncond": [0, 1],
+        },
+        torch.tensor([0.0]),
+        (2, 8, 4, 4),
+    )
+    assert decision["actual_forward"] is True
+    assert decision["forecast_safe"] is False
+    assert decision["stream_key"] is None
+
+
+def test_non_iterable_stream_identity_fails_open() -> None:
+    """Non-iterable stream metadata should fail open instead of raising."""
+    runtime = SpectrumSDXLRuntime(_make_cfg())
+    sample_sigmas = torch.linspace(1.0, 0.0, 4)
+
+    decision = runtime.begin_step(
+        {
+            "sample_sigmas": sample_sigmas,
+            "sigmas": torch.tensor([1.0]),
+            "uuids": 123,
+            "cond_or_uncond": [0],
+        },
+        torch.tensor([0.0]),
+        (1, 8, 4, 4),
+    )
+    assert decision["actual_forward"] is True
+    assert decision["forecast_safe"] is False
+    assert decision["stream_key"] is None
+
+
 def test_global_step_index_uses_cached_schedule_metadata() -> None:
     """Step lookup should not rebuild the schedule signature after sync."""
     runtime = SpectrumSDXLRuntime(_make_cfg())
@@ -537,6 +577,8 @@ def main() -> None:
     test_step_zero_same_stream_token_churn_resets_only_that_stream()
     test_mid_run_token_change_does_not_reset()
     test_missing_stream_identity_fails_open()
+    test_malformed_stream_identity_fails_open()
+    test_non_iterable_stream_identity_fails_open()
     test_global_step_index_uses_cached_schedule_metadata()
     print("ok")
 
