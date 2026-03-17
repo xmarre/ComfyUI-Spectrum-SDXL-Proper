@@ -23,6 +23,8 @@ This follows the paper’s core design:
 - **Chebyshev polynomial** forecasting over time
 - **ridge regression** coefficient fitting
 - **last-block / last-hidden-only** caching instead of per-module caching
+- **solver-step-based scheduling** keyed to the actual diffusion step index
+- **fail-open runtime guard** when warmup reveals a multi-stream step layout
 - **adaptive scheduling** via `window_size` + `flex_window`
 
 ## Why this repo exists separately
@@ -63,7 +65,7 @@ No additional Python dependencies are required beyond the normal ComfyUI stack.
 - `ridge_lambda` — `λ`, ridge regularization strength
 - `window_size` — initial adaptive scheduling window
 - `flex_window` — growth added to the scheduling window after each real forward
-- `warmup_steps` — number of initial real forwards before forecasting is allowed
+- `warmup_steps` — number of initial **solver steps** that must run as real forwards before forecasting is allowed
 - `debug` — currently stored in runtime metadata only
 
 **Output**
@@ -118,7 +120,7 @@ Higher values are more aggressive and usually faster, but quality drops sooner.
 
 ### `warmup_steps`
 
-Initial real steps before forecasting begins.
+Initial real **solver steps** before forecasting begins.
 
 Recommended default: `5`
 
@@ -190,11 +192,31 @@ That matters because Spectrum is defined as feature forecasting inside the denoi
 
 The runtime synchronizes with the sampler via `transformer_options["sample_sigmas"]` / `transformer_options["sigmas"]` when available, instead of trying to detect new runs purely from monotonic timestep changes.
 
+Forecast eligibility is keyed to the resolved **global diffusion step index** from that sigma schedule, not to a per-stream local call counter. This keeps warmup behavior aligned to the actual solver step sequence.
+
 ### Step normalization
 
 The official public code often assumes a 50-step run when mapping timesteps into the Chebyshev domain. This port instead normalizes against the **actual current sampler step count** derived from the sigma schedule.
 
 That is a deliberate compatibility fix for normal ComfyUI usage, where users frequently run non-50-step schedules.
+
+### Multi-stream warmup fail-open behavior
+
+The official SDXL Spectrum integration assumes one denoiser trajectory per solver step.
+
+ComfyUI workflows can expose layouts where the same solver step appears as multiple logical runtime streams during warmup. In that situation this port cannot guarantee that it is forecasting the same mathematical object as the official SDXL path.
+
+When warmup reveals **multiple logical streams for one solver step**, the runtime now **fails open** for that run:
+
+- forecasting is disabled for the remainder of the run,
+- subsequent steps use real forwards only,
+- the goal is to preserve correctness rather than force acceleration through an incompatible step layout.
+
+This is a correctness guard, not a performance optimization.
+
+In practice this matters most for workflows that expose multi-stream same-step execution during warmup, including some aggressive low-step / distilled SDXL setups where forcing forecasted branch-local trajectories can produce obvious chroma, noise, or under-denoising artifacts.
+
+Single-stream runs keep the normal Spectrum behavior.
 
 ## Assumptions, caveats, and known limitations
 
@@ -211,6 +233,16 @@ It is **not** intended for FLUX / SD3 / Wan / Hunyuan; those need backend-specif
 On a forecasted step, the expensive internal U-Net blocks are skipped by design.
 
 That means custom nodes that rely on mutating **internal block execution on every step** will not see those block-level effects on skipped steps. This is inherent to Spectrum’s acceleration strategy, not a bug in the port.
+
+### Distilled / few-step SDXL workflows
+
+Aggressive few-step distilled SDXL workflows can be much less tolerant of internal denoiser approximation than standard longer-step SDXL sampling.
+
+This port now guards one important failing path automatically by disabling forecasting when warmup exposes a multi-stream same-step layout. That helps avoid forcing Spectrum through a runtime shape that does not match the official SDXL assumption.
+
+This does **not** mean every distilled workflow will accelerate well. It means the runtime now prefers correctness over silently applying forecasting in a path already shown to violate the integration contract.
+
+If a run falls back to all-actual forwards because of the multi-stream warmup guard, that is expected behavior.
 
 ### Dynamic control modules
 
@@ -252,6 +284,12 @@ This repo includes a lightweight non-ComfyUI smoke test for the forecaster/runti
 ```bash
 python tests/smoke_runtime.py
 ```
+
+The smoke suite includes coverage for:
+
+- single-stream forecasting,
+- multi-stream warmup fail-open behavior,
+- stream-state isolation and retry safety.
 
 Expected output:
 
