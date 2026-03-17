@@ -58,6 +58,7 @@ class SpectrumSDXLRuntime:
         self._pending_schedule_token = None
         self._sigma_to_step: Dict[float, int] = {}
         self._ambiguous_schedule_sigmas: Set[float] = set()
+        self._step_coords: Tuple[float, ...] = ()
         self._stream_keys_by_global_step: Dict[int, Set[StreamKey]] = {}
         self._forecast_disabled = False
         self._forecast_disable_reason: Optional[str] = None
@@ -114,6 +115,7 @@ class SpectrumSDXLRuntime:
         """Build a sigma-to-global-step lookup for the current schedule signature."""
         self._sigma_to_step: Dict[float, int] = {}
         self._ambiguous_schedule_sigmas: Set[float] = set()
+        self._step_coords = tuple(float(v) for v in sig[:-1])
         for idx, sigma in enumerate(sig[:-1]):
             if sigma in self._ambiguous_schedule_sigmas:
                 continue
@@ -227,6 +229,18 @@ class SpectrumSDXLRuntime:
         if sigma in self._ambiguous_schedule_sigmas:
             return None
         return self._sigma_to_step.get(sigma)
+
+    def step_coord(self, global_step_idx: int) -> float:
+        """Resolve the forecast coordinate for one global diffusion step."""
+        if 0 <= int(global_step_idx) < len(self._step_coords):
+            return float(self._step_coords[int(global_step_idx)])
+        return float(global_step_idx)
+
+    def schedule_coords(self) -> Tuple[float, ...]:
+        """Return the active denoiser-step coordinate sequence."""
+        if self._step_coords:
+            return self._step_coords
+        return tuple(float(i) for i in range(self.num_steps()))
 
     def _ensure_stream_state(self, stream_key: StreamKey) -> _StreamState:
         """Return the existing stream state or create a fresh one."""
@@ -395,7 +409,7 @@ class SpectrumSDXLRuntime:
             return
         if global_step_idx in state.observed_global_steps:
             return
-        state.forecaster.update(global_step_idx, feature)
+        state.forecaster.update(self.step_coord(global_step_idx), feature)
         self.finalize_step(stream_key, global_step_idx, used_forecast=False)
         state.observed_global_steps.add(global_step_idx)
 
@@ -404,4 +418,4 @@ class SpectrumSDXLRuntime:
         state = self.stream_states.get(stream_key)
         if state is None:
             raise RuntimeError("Spectrum runtime has no state for the requested stream.")
-        return state.forecaster.predict(global_step_idx, self.num_steps())
+        return state.forecaster.predict(self.step_coord(global_step_idx), self.schedule_coords())

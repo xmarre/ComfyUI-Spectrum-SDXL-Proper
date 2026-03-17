@@ -23,7 +23,7 @@ This follows the paper’s core design:
 - **Chebyshev polynomial** forecasting over time
 - **ridge regression** coefficient fitting
 - **last-block / last-hidden-only** caching instead of per-module caching
-- **solver-step-based scheduling** keyed to the actual diffusion step index
+- **schedule-coordinate-based forecasting** keyed to the active `sample_sigmas` sequence
 - **fail-open runtime guard** when warmup reveals a multi-stream step layout
 - **adaptive scheduling** via `window_size` + `flex_window`
 
@@ -196,7 +196,7 @@ Forecast eligibility is keyed to the resolved **global diffusion step index** fr
 
 ### Step normalization
 
-The official public code often assumes a 50-step run when mapping timesteps into the Chebyshev domain. This port instead normalizes against the **actual current sampler step count** derived from the sigma schedule.
+The official public code often assumes a 50-step run when mapping timesteps into the Chebyshev domain. This port instead uses the active schedule coordinate sequence from `sample_sigmas`, rather than ordinal step index, when mapping the trajectory into the Chebyshev domain.
 
 That is a deliberate compatibility fix for normal ComfyUI usage, where users frequently run non-50-step schedules.
 

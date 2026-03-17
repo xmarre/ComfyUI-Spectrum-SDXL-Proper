@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 
 from comfyui_spectrum_sdxl.config import SpectrumSDXLConfig
+from comfyui_spectrum_sdxl.forecast import ChebyshevFeatureForecaster
 from comfyui_spectrum_sdxl.runtime import SpectrumSDXLRuntime
 
 
@@ -760,6 +761,23 @@ def test_global_step_index_uses_cached_schedule_metadata() -> None:
     assert runtime.global_step_index(round(float(sample_sigmas[2].item()), 8)) == 2
 
 
+def test_forecaster_uses_schedule_coordinates_not_ordinal_step_index() -> None:
+    """Linear extrapolation must respect non-uniform schedule spacing."""
+    forecaster = ChebyshevFeatureForecaster(
+        degree=2,
+        ridge_lambda=0.1,
+        blend_weight=0.0,
+        history_size=10,
+    )
+    schedule_coords = (10.0, 9.0, 1.0)
+    forecaster.update(10.0, torch.tensor([10.0]))
+    forecaster.update(9.0, torch.tensor([9.0]))
+
+    pred = forecaster.predict(1.0, schedule_coords)
+
+    assert torch.allclose(pred, torch.tensor([1.0]), atol=1e-5)
+
+
 def main() -> None:
     """Run the lightweight regression suite without external test tooling."""
     test_single_stream_forecasts()
@@ -779,6 +797,7 @@ def main() -> None:
     test_malformed_stream_identity_fails_open()
     test_non_iterable_stream_identity_fails_open()
     test_global_step_index_uses_cached_schedule_metadata()
+    test_forecaster_uses_schedule_coordinates_not_ordinal_step_index()
     print("ok")
 
 
