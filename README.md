@@ -1,6 +1,8 @@
 # ComfyUI Spectrum SDXL Proper
 
-Native ComfyUI custom node that ports **Spectrum** to the **SDXL / U-Net** execution path.
+Native ComfyUI custom node that ports [**Spectrum**](https://hanjq17.github.io/Spectrum/) to the **SDXL / U-Net** execution path.
+
+It is based on the paper [*Adaptive Spectral Feature Forecasting for Diffusion Sampling Acceleration*](https://arxiv.org/abs/2603.01623) and adapts the method to the native ComfyUI SDXL execution path.
 
 This repo is intentionally narrower than a generic “works on every model” wrapper. It targets the native ComfyUI U-Net path used by SDXL-family checkpoints and hooks at the **final hidden feature before the SDXL output head**, which is the correct analogue of the official SDXL implementation.
 
@@ -259,7 +261,7 @@ ok
 
 ## References
 
-- Paper: `Adaptive Spectral Feature Forecasting for Diffusion Sampling Acceleration`
-- Project page: `https://hanjq17.github.io/Spectrum/`
-- Official code: `https://github.com/hanjq17/Spectrum`
-- Existing community SDXL node reviewed as reference: `https://github.com/ruwwww/comfyui-spectrum-sdxl`
+- Paper: [*Adaptive Spectral Feature Forecasting for Diffusion Sampling Acceleration*](https://arxiv.org/abs/2603.01623)
+- Spectrum project page: [Spectrum](https://hanjq17.github.io/Spectrum/)
+- Official implementation: [hanjq17/Spectrum](https://github.com/hanjq17/Spectrum)
+- Community SDXL reference reviewed during this port: [ruwwww/comfyui-spectrum-sdxl](https://github.com/ruwwww/comfyui-spectrum-sdxl)
