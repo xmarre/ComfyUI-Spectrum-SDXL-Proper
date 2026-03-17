@@ -88,16 +88,17 @@ def _wrap_sdxl_unet_forward(inner: Any) -> None:
         )
         import torch as th
 
-        decision = runtime.begin_step(transformer_options, timesteps)
-        step_idx = decision["step_idx"]
+        decision = runtime.begin_step(transformer_options, timesteps, tuple(int(v) for v in x.shape))
+        global_step_idx = decision["global_step_idx"]
         actual_forward = decision["actual_forward"]
+        stream_key = decision["stream_key"]
 
         transformer_options["original_shape"] = list(x.shape)
         transformer_options["transformer_index"] = 0
 
-        if (not actual_forward) and runtime.forecaster.ready():
+        if not actual_forward:
             try:
-                predicted_h = runtime.predict_feature(step_idx)
+                predicted_h = runtime.predict_feature(stream_key, global_step_idx)
             except Exception:
                 predicted_h = None
 
@@ -197,7 +198,7 @@ def _wrap_sdxl_unet_forward(inner: Any) -> None:
             )
 
         h = h.type(x.dtype)
-        runtime.observe_actual_feature(step_idx, h)
+        runtime.observe_actual_feature(stream_key, global_step_idx, h)
 
         if getattr(inner, "predict_codebook_ids", False):
             return inner.id_predictor(h)
