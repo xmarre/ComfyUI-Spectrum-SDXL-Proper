@@ -196,6 +196,8 @@ def test_observe_retry_after_update_failure() -> None:
             assert str(exc) == "boom"
         assert state.observed_global_steps == set()
         assert state.forecaster.history == []
+        assert runtime.last_info["actual_forward_count"] == 0
+        assert state.decisions_by_global_step[decision["global_step_idx"]]["finalized"] is False
     finally:
         state.forecaster.update = original_update
 
@@ -206,6 +208,8 @@ def test_observe_retry_after_update_failure() -> None:
     )
     assert state.observed_global_steps == {0}
     assert len(state.forecaster.history) == 1
+    assert runtime.last_info["actual_forward_count"] == 1
+    assert state.decisions_by_global_step[decision["global_step_idx"]]["finalized"] is True
 
 
 def test_same_schedule_restart_resets_stream_state() -> None:
@@ -510,6 +514,9 @@ def test_global_step_index_uses_cached_schedule_metadata() -> None:
     runtime = SpectrumSDXLRuntime(_make_cfg())
     sample_sigmas = torch.linspace(1.0, 0.0, 6)
     runtime._ensure_run_sync({"sample_sigmas": sample_sigmas})
+    # This patches a private method on purpose: after _ensure_run_sync()
+    # populates cached metadata, global_step_index() should resolve from that
+    # cache alone and must not re-read transformer_options.
     runtime._schedule_signature = lambda _transformer_options: (_ for _ in ()).throw(
         AssertionError("global_step_index should use cached schedule metadata")
     )

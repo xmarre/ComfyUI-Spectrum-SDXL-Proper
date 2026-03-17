@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+import math
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import torch
@@ -101,7 +102,7 @@ class SpectrumSDXLRuntime:
                 str(sample_sigmas.device),
                 str(sample_sigmas.dtype),
             )
-        except Exception:
+        except (AttributeError, TypeError, ValueError, RuntimeError):
             return id(sample_sigmas)
 
     def _rebuild_schedule_index(self, sig: Tuple[float, ...]) -> None:
@@ -177,7 +178,7 @@ class SpectrumSDXLRuntime:
             uuid_key = tuple(str(u) for u in uuids)
             cond_key = tuple(int(v) for v in cond_or_uncond)
             shape_key = tuple(int(v) for v in input_shape)
-        except Exception:
+        except (TypeError, ValueError):
             return None
 
         if not shape_key or (not uuid_key and not cond_key):
@@ -280,7 +281,7 @@ class SpectrumSDXLRuntime:
 
         actual_forward = True
         if local_step_count >= self.cfg.warmup_steps:
-            ws_floor = max(1, int(torch.floor(torch.tensor(state.curr_ws)).item()))
+            ws_floor = max(1, math.floor(float(state.curr_ws)))
             actual_forward = ((state.num_consecutive_cached_steps + 1) % ws_floor) == 0
 
         if not state.forecaster.ready():
@@ -342,8 +343,8 @@ class SpectrumSDXLRuntime:
             return
         if global_step_idx in state.observed_global_steps:
             return
-        self.finalize_step(stream_key, global_step_idx, used_forecast=False)
         state.forecaster.update(global_step_idx, feature)
+        self.finalize_step(stream_key, global_step_idx, used_forecast=False)
         state.observed_global_steps.add(global_step_idx)
 
     def predict_feature(self, stream_key: StreamKey, global_step_idx: int) -> torch.Tensor:
