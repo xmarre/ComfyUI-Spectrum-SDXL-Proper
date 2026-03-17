@@ -68,10 +68,8 @@ class ChebyshevFeatureForecaster:
 
     def _tau(self, time_values: torch.Tensor, total_steps: int) -> torch.Tensor:
         """Map solver-step coordinates to the Chebyshev domain ``[-1, 1]``."""
-        t_min = time_values.min()
-        t_max = time_values.max()
-        eps = torch.tensor(1e-8, dtype=time_values.dtype, device=time_values.device)
-        return (time_values - t_min) / (t_max - t_min + eps) * 2.0 - 1.0
+        denom = max(int(total_steps) - 1, 1)
+        return (time_values.to(torch.float32) / float(denom)) * 2.0 - 1.0
 
     def _design(self, taus: torch.Tensor, degree: int) -> torch.Tensor:
         """Construct the Chebyshev design matrix up to the requested degree."""

@@ -313,6 +313,24 @@ def test_forecaster_uses_schedule_coordinates_not_ordinal_step_index() -> None:
     assert torch.allclose(pred, torch.tensor([1.0]), atol=1e-5)
 
 
+def test_chebyshev_prediction_varies_with_time_coord() -> None:
+    """The pure Chebyshev branch must not collapse all future steps to one value."""
+    forecaster = ChebyshevFeatureForecaster(
+        degree=1,
+        ridge_lambda=0.0,
+        blend_weight=1.0,
+        history_size=10,
+    )
+    forecaster.update(0.0, torch.tensor([0.0]))
+    forecaster.update(1.0, torch.tensor([1.0]))
+
+    pred_two = forecaster.predict(2.0, 4)
+    pred_three = forecaster.predict(3.0, 4)
+
+    assert torch.allclose(pred_two, torch.tensor([2.0]), atol=1e-5)
+    assert torch.allclose(pred_three, torch.tensor([3.0]), atol=1e-5)
+
+
 def main() -> None:
     """Run the lightweight regression suite without external test tooling."""
     test_missing_solver_step_context_fails_open()
@@ -328,6 +346,7 @@ def main() -> None:
     test_forecast_fallback_commits_actual_bookkeeping()
     test_run_id_switch_resets_stream_state()
     test_forecaster_uses_schedule_coordinates_not_ordinal_step_index()
+    test_chebyshev_prediction_varies_with_time_coord()
     print("ok")
 
 
