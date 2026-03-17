@@ -1,3 +1,5 @@
+"""ComfyUI node definitions for the native SDXL Spectrum port."""
+
 from __future__ import annotations
 
 from .comfyui_spectrum_sdxl.config import SpectrumSDXLConfig
@@ -5,8 +7,11 @@ from .comfyui_spectrum_sdxl.sdxl import SDXLSpectrumPatcher
 
 
 class SpectrumApplySDXL:
+    """Apply the native SDXL Spectrum runtime patch to a ComfyUI model."""
+
     @classmethod
     def INPUT_TYPES(cls):
+        """Return the ComfyUI input schema for the Spectrum SDXL node."""
         return {
             "required": {
                 "model": ("MODEL",),
@@ -38,6 +43,7 @@ class SpectrumApplySDXL:
         warmup_steps,
         debug,
     ):
+        """Validate node parameters and return a patched ComfyUI model."""
         if not enabled:
             return (model,)
 
