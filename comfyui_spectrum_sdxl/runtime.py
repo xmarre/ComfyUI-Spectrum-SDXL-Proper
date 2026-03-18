@@ -248,6 +248,11 @@ class SpectrumSDXLRuntime:
         ctx, reason = self._solver_step_context(transformer_options)
         if ctx is None:
             self._disable_forecasting(reason or "invalid_solver_step_context")
+            if self.cfg.debug:
+                print(
+                    f"[Spectrum SDXL] fail-open: reason={self._forecast_disable_reason} "
+                    f"stream_key_present={stream_key is not None}"
+                )
             self.last_info["actual_forward_count"] += 1
             return {
                 "global_step_idx": None,
@@ -267,6 +272,11 @@ class SpectrumSDXLRuntime:
 
         if stream_key is None:
             self._disable_forecasting("missing_stream_identity")
+            if self.cfg.debug:
+                print(
+                    f"[Spectrum SDXL] fail-open: reason=missing_stream_identity "
+                    f"run={ctx['run_id']} step={ctx['solver_step_id']}"
+                )
             self.last_info["actual_forward_count"] += 1
             return {
                 "global_step_idx": ctx["solver_step_id"],
@@ -319,6 +329,15 @@ class SpectrumSDXLRuntime:
         }
         state.decisions_by_solver_step[ctx["solver_step_id"]] = decision
         self.last_info["curr_ws"] = state.curr_ws
+        if self.cfg.debug:
+            print(
+                f"[Spectrum SDXL] begin "
+                f"run={ctx['run_id']} step={ctx['solver_step_id']} "
+                f"local={local_step_count} actual={actual_forward} "
+                f"forecast_safe={forecast_safe} ready={state.forecaster.ready()} "
+                f"ws={state.curr_ws:.3f} cached={state.num_consecutive_cached_steps} "
+                f"stream={stream_key}"
+            )
         return decision
 
     def finalize_step(self, stream_key: Optional[StreamKey], solver_step_id: Optional[int], used_forecast: bool) -> None:
@@ -347,6 +366,14 @@ class SpectrumSDXLRuntime:
 
         decision["finalized"] = True
         self.last_info["curr_ws"] = state.curr_ws
+        if self.cfg.debug:
+            print(
+                f"[Spectrum SDXL] finalize "
+                f"step={solver_step_id} used_forecast={used_forecast} "
+                f"curr_ws={state.curr_ws:.3f} "
+                f"forecasted_passes={self.last_info['forecasted_passes']} "
+                f"actual_forward_count={self.last_info['actual_forward_count']}"
+            )
 
     def observe_actual_feature(self, stream_key: Optional[StreamKey], solver_step_id: Optional[int], feature: torch.Tensor) -> None:
         """Record a real hidden feature for one explicit solver step once."""
