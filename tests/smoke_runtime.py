@@ -7,7 +7,7 @@ import torch
 from comfyui_spectrum_sdxl.config import SpectrumSDXLConfig
 from comfyui_spectrum_sdxl.forecast import ChebyshevFeatureForecaster
 from comfyui_spectrum_sdxl.runtime import SpectrumSDXLRuntime
-from comfyui_spectrum_sdxl.sdxl import _SpectrumOuterStepController
+from comfyui_spectrum_sdxl.sdxl import _SpectrumModelFunctionWrapper, _SpectrumOuterStepController
 
 
 def _make_cfg() -> SpectrumSDXLConfig:
@@ -219,6 +219,204 @@ def test_outer_step_controller_uses_ordinal_time_coord() -> None:
     assert second["spectrum_solver_step_id"] == 1
     assert first["spectrum_time_coord"] == 0.0
     assert second["spectrum_time_coord"] == 1.0
+
+
+def test_model_function_wrapper_injects_context_for_bypassed_guider_path() -> None:
+    """The compat wrapper must stamp context when the sampler hook is skipped."""
+    runtime = SpectrumSDXLRuntime(_make_cfg())
+    controller = _SpectrumOuterStepController(runtime=runtime)
+    wrapper = _SpectrumModelFunctionWrapper(controller=controller)
+
+    def apply_model(input_x, timestep, **c):
+        del input_x, timestep
+        return c["transformer_options"].copy()
+
+    sample_sigmas = torch.tensor([14.0, 7.0, 1.5, 0.0], dtype=torch.float32)
+    first = wrapper(
+        apply_model,
+        {
+            "c": {"transformer_options": {"sample_sigmas": sample_sigmas}},
+            "timestep": torch.tensor([14.0]),
+            "input": torch.zeros((1, 4, 8, 8)),
+        },
+    )
+    second = wrapper(
+        apply_model,
+        {
+            "c": {"transformer_options": {"sample_sigmas": sample_sigmas}},
+            "timestep": torch.tensor([7.0]),
+            "input": torch.zeros((1, 4, 8, 8)),
+        },
+    )
+
+    assert first["spectrum_run_id"] == second["spectrum_run_id"]
+    assert first["spectrum_solver_step_id"] == 0
+    assert second["spectrum_solver_step_id"] == 1
+    assert second["spectrum_total_steps"] == 3
+
+
+def test_model_function_wrapper_reuses_solver_step_for_repeated_same_sigma_subcalls() -> None:
+    """Repeated guider subcalls for one outer step must not advance the solver-step id."""
+    runtime = SpectrumSDXLRuntime(_make_cfg())
+    controller = _SpectrumOuterStepController(runtime=runtime)
+    wrapper = _SpectrumModelFunctionWrapper(controller=controller)
+
+    def apply_model(input_x, timestep, **c):
+        del input_x, timestep
+        return c["transformer_options"].copy()
+
+    sample_sigmas = torch.tensor([14.0, 7.0, 1.5, 0.0], dtype=torch.float32)
+    first = wrapper(
+        apply_model,
+        {
+            "c": {"transformer_options": {"sample_sigmas": sample_sigmas}},
+            "timestep": torch.tensor([14.0]),
+            "input": torch.zeros((1, 4, 8, 8)),
+        },
+    )
+    repeated = wrapper(
+        apply_model,
+        {
+            "c": {"transformer_options": {"sample_sigmas": sample_sigmas}},
+            "timestep": torch.tensor([14.0]),
+            "input": torch.zeros((1, 4, 8, 8)),
+        },
+    )
+    next_step = wrapper(
+        apply_model,
+        {
+            "c": {"transformer_options": {"sample_sigmas": sample_sigmas}},
+            "timestep": torch.tensor([7.0]),
+            "input": torch.zeros((1, 4, 8, 8)),
+        },
+    )
+
+    assert repeated["spectrum_run_id"] == first["spectrum_run_id"]
+    assert repeated["spectrum_solver_step_id"] == first["spectrum_solver_step_id"] == 0
+    assert next_step["spectrum_solver_step_id"] == 1
+
+
+def test_model_function_wrapper_same_object_restart_resets_run_state() -> None:
+    """Returning to the first sigma with the same schedule tensor must start a new run."""
+    runtime = SpectrumSDXLRuntime(_make_cfg())
+    controller = _SpectrumOuterStepController(runtime=runtime)
+    wrapper = _SpectrumModelFunctionWrapper(controller=controller)
+
+    def apply_model(input_x, timestep, **c):
+        del input_x, timestep
+        return c["transformer_options"].copy()
+
+    sample_sigmas = torch.linspace(1.0, 0.0, 6)
+    first = wrapper(
+        apply_model,
+        {
+            "c": {"transformer_options": {"sample_sigmas": sample_sigmas}},
+            "timestep": torch.tensor([float(sample_sigmas[0].item())]),
+            "input": torch.zeros((1, 4, 8, 8)),
+        },
+    )
+    second = wrapper(
+        apply_model,
+        {
+            "c": {"transformer_options": {"sample_sigmas": sample_sigmas}},
+            "timestep": torch.tensor([float(sample_sigmas[1].item())]),
+            "input": torch.zeros((1, 4, 8, 8)),
+        },
+    )
+    restarted = wrapper(
+        apply_model,
+        {
+            "c": {"transformer_options": {"sample_sigmas": sample_sigmas}},
+            "timestep": torch.tensor([float(sample_sigmas[0].item())]),
+            "input": torch.zeros((1, 4, 8, 8)),
+        },
+    )
+
+    assert first["spectrum_run_id"] == second["spectrum_run_id"]
+    assert second["spectrum_solver_step_id"] == 1
+    assert restarted["spectrum_run_id"] != first["spectrum_run_id"]
+    assert restarted["spectrum_solver_step_id"] == 0
+    assert restarted["spectrum_time_coord"] == 0.0
+
+
+def test_model_function_wrapper_preserves_existing_context() -> None:
+    """The compat wrapper must not overwrite context from the sampler-layer hook."""
+    runtime = SpectrumSDXLRuntime(_make_cfg())
+    controller = _SpectrumOuterStepController(runtime=runtime)
+    wrapper = _SpectrumModelFunctionWrapper(controller=controller)
+
+    def apply_model(input_x, timestep, **c):
+        del input_x, timestep
+        return c["transformer_options"].copy()
+
+    transformer_options = {
+        "sample_sigmas": torch.tensor([14.0, 7.0, 1.5, 0.0], dtype=torch.float32),
+        "spectrum_run_id": 99,
+        "spectrum_solver_step_id": 4,
+        "spectrum_time_coord": 4.0,
+        "spectrum_total_steps": 12,
+    }
+    seen = wrapper(
+        apply_model,
+        {
+            "c": {"transformer_options": transformer_options},
+            "timestep": torch.tensor([7.0]),
+            "input": torch.zeros((1, 4, 8, 8)),
+        },
+    )
+
+    assert seen["spectrum_run_id"] == 99
+    assert seen["spectrum_solver_step_id"] == 4
+    assert seen["spectrum_time_coord"] == 4.0
+    assert seen["spectrum_total_steps"] == 12
+
+
+def test_model_function_wrapper_injects_context_for_delegate_internal_apply_calls() -> None:
+    """Delegate-internal apply_model calls must still pass through Spectrum injection."""
+    runtime = SpectrumSDXLRuntime(_make_cfg())
+    controller = _SpectrumOuterStepController(runtime=runtime)
+
+    captured = []
+
+    def apply_model(input_x, timestep, **c):
+        del input_x
+        captured.append(
+            {
+                "timestep": float(timestep.flatten()[0].item()),
+                "transformer_options": c["transformer_options"].copy(),
+            }
+        )
+        return timestep
+
+    def delegate(wrapped_apply_model, args):
+        base = args["c"].get("transformer_options", {})
+        t0 = args["timestep"]
+        t1 = torch.tensor([7.0], dtype=t0.dtype)
+        wrapped_apply_model(args["input"], t0, transformer_options={"sample_sigmas": base["sample_sigmas"]})
+        wrapped_apply_model(args["input"], t0, transformer_options={"sample_sigmas": base["sample_sigmas"]})
+        wrapped_apply_model(args["input"], t1, transformer_options={"sample_sigmas": base["sample_sigmas"]})
+        return captured
+
+    wrapper = _SpectrumModelFunctionWrapper(controller=controller, delegate=delegate)
+    sample_sigmas = torch.tensor([14.0, 7.0, 1.5, 0.0], dtype=torch.float32)
+    result = wrapper(
+        apply_model,
+        {
+            "c": {"transformer_options": {"sample_sigmas": sample_sigmas}},
+            "timestep": torch.tensor([14.0], dtype=torch.float32),
+            "input": torch.zeros((1, 4, 8, 8)),
+        },
+    )
+
+    assert len(result) == 3
+    first = result[0]["transformer_options"]
+    second = result[1]["transformer_options"]
+    third = result[2]["transformer_options"]
+
+    assert first["spectrum_solver_step_id"] == 0
+    assert second["spectrum_solver_step_id"] == 0
+    assert third["spectrum_solver_step_id"] == 1
+    assert first["spectrum_run_id"] == second["spectrum_run_id"] == third["spectrum_run_id"]
 
 
 def test_forecast_request_before_history_fails_open_per_step() -> None:
@@ -439,6 +637,11 @@ def main() -> None:
     test_outer_step_controller_injects_context_and_resets_runs()
     test_outer_step_controller_same_object_restart_resets_run_state()
     test_outer_step_controller_uses_ordinal_time_coord()
+    test_model_function_wrapper_injects_context_for_bypassed_guider_path()
+    test_model_function_wrapper_reuses_solver_step_for_repeated_same_sigma_subcalls()
+    test_model_function_wrapper_same_object_restart_resets_run_state()
+    test_model_function_wrapper_preserves_existing_context()
+    test_model_function_wrapper_injects_context_for_delegate_internal_apply_calls()
     test_forecast_request_before_history_fails_open_per_step()
     test_duplicate_actual_updates_are_deduped()
     test_forecast_fallback_commits_actual_bookkeeping()

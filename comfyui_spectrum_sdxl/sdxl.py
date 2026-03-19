@@ -15,6 +15,7 @@ _CFG_KEY = "spectrum_sdxl_cfg"
 _ENABLED_KEY = "spectrum_sdxl_enabled"
 _BACKEND_KEY = "spectrum_backend"
 _OUTER_STEP_CONTROLLER_KEY = "spectrum_sdxl_outer_step_controller"
+_MODEL_FUNCTION_WRAPPER_KEY = "spectrum_sdxl_model_function_wrapper"
 
 _RUN_ID_KEY = "spectrum_run_id"
 _SOLVER_STEP_ID_KEY = "spectrum_solver_step_id"
@@ -81,11 +82,12 @@ class _SpectrumOuterStepController:
         self._current_run_token = None
         self._run_serial = 0
         self._next_solver_step_id = 0
+        self._active_step_marker = None
+        self._active_solver_step_id = 0
 
-    def _extract_time_coord(self, transformer_options: Dict[str, Any]) -> float:
+    def _extract_time_coord(self, solver_step_id: int) -> float:
         """Keep the forecast axis aligned with the ordinal outer-step index."""
-        del transformer_options
-        return float(self._next_solver_step_id)
+        return float(solver_step_id)
 
     def _sample_sigmas_token(self, transformer_options: Dict[str, Any]):
         sample_sigmas = transformer_options.get("sample_sigmas", None)
@@ -108,27 +110,13 @@ class _SpectrumOuterStepController:
         except Exception:
             return None
 
-    def _looks_like_same_token_restart(self, args: Dict[str, Any], transformer_options: Dict[str, Any]) -> bool:
-        """
-        Detect a new generation that reuses the exact same schedule tensor object.
-
-        The controller already resets on schedule-token churn. This guard covers
-        the remaining hole where a new generation restarts at the first sigma
-        after prior progress, but ComfyUI reuses the same ``sample_sigmas``
-        tensor object.
-        """
-        if self._next_solver_step_id <= 1:
-            return False
-
-        sample_sigmas = transformer_options.get("sample_sigmas", None)
-        if sample_sigmas is None:
-            return False
-
-        first_sigma = self._sigma_value(sample_sigmas[0])
-        current_sigma = self._sigma_value(args.get("sigma", None))
-        if first_sigma is None or current_sigma is None:
-            return False
-        return current_sigma == first_sigma
+    def _begin_run(self, run_token) -> None:
+        """Reset controller state for one logical sampling run."""
+        self._current_run_token = run_token
+        self._run_serial += 1
+        self._next_solver_step_id = 0
+        self._active_step_marker = None
+        self._active_solver_step_id = 0
 
     def _extract_total_steps(self, transformer_options: Dict[str, Any]) -> int:
         sample_sigmas = transformer_options.get("sample_sigmas", None)
@@ -139,25 +127,70 @@ class _SpectrumOuterStepController:
                 pass
         return max(int(self.runtime.last_info.get("num_steps", 0)), 1)
 
+    def _ensure_step_context(
+        self,
+        *,
+        transformer_options: Dict[str, Any],
+        sigma,
+        run_token_fallback,
+        reuse_active_step: bool,
+    ) -> None:
+        """Stamp stable Spectrum outer-step metadata onto transformer options."""
+        run_token = self._sample_sigmas_token(transformer_options)
+        if run_token is None:
+            run_token = run_token_fallback
+        if run_token != self._current_run_token:
+            self._begin_run(run_token)
+
+        current_sigma = self._sigma_value(sigma)
+        first_sigma = None
+        sample_sigmas = transformer_options.get("sample_sigmas", None)
+        if sample_sigmas is not None:
+            try:
+                first_sigma = self._sigma_value(sample_sigmas[0])
+            except Exception:
+                first_sigma = None
+
+        if (
+            self._next_solver_step_id > 1
+            and first_sigma is not None
+            and current_sigma is not None
+            and current_sigma == first_sigma
+            and self._active_step_marker is not None
+            and self._active_step_marker[0] == run_token
+            and self._active_step_marker[1] != current_sigma
+        ):
+            self._begin_run(run_token)
+
+        if reuse_active_step:
+            step_marker = (run_token, current_sigma)
+            if self._active_step_marker != step_marker:
+                solver_step_id = self._next_solver_step_id
+                self._active_step_marker = step_marker
+                self._active_solver_step_id = solver_step_id
+                self._next_solver_step_id += 1
+            else:
+                solver_step_id = self._active_solver_step_id
+        else:
+            solver_step_id = self._next_solver_step_id
+            self._active_step_marker = (run_token, current_sigma)
+            self._active_solver_step_id = solver_step_id
+            self._next_solver_step_id += 1
+
+        transformer_options[_RUN_ID_KEY] = self._run_serial
+        transformer_options[_SOLVER_STEP_ID_KEY] = solver_step_id
+        transformer_options[_TIME_COORD_KEY] = self._extract_time_coord(solver_step_id)
+        transformer_options[_TOTAL_STEPS_KEY] = self._extract_total_steps(transformer_options)
+
     def _ensure_outer_step_context(self, args: Dict[str, Any]) -> None:
         model_options = args["model_options"]
         transformer_options = model_options.setdefault("transformer_options", {})
-        run_token = self._sample_sigmas_token(transformer_options)
-        if run_token is None:
-            run_token = ("model_options", id(model_options))
-        if run_token != self._current_run_token:
-            self._current_run_token = run_token
-            self._run_serial += 1
-            self._next_solver_step_id = 0
-        elif self._looks_like_same_token_restart(args, transformer_options):
-            self._run_serial += 1
-            self._next_solver_step_id = 0
-
-        transformer_options[_RUN_ID_KEY] = self._run_serial
-        transformer_options[_SOLVER_STEP_ID_KEY] = self._next_solver_step_id
-        transformer_options[_TIME_COORD_KEY] = self._extract_time_coord(transformer_options)
-        transformer_options[_TOTAL_STEPS_KEY] = self._extract_total_steps(transformer_options)
-        self._next_solver_step_id += 1
+        self._ensure_step_context(
+            transformer_options=transformer_options,
+            sigma=args.get("sigma", None),
+            run_token_fallback=("model_options", id(model_options)),
+            reuse_active_step=False,
+        )
 
     def __call__(self, args):
         model_options = args["model_options"]
@@ -187,6 +220,44 @@ class _SpectrumOuterStepController:
         )
 
 
+class _SpectrumModelFunctionWrapper:
+    """Backfill outer-step context for guider paths that bypass the sampler hook."""
+
+    def __init__(self, controller: _SpectrumOuterStepController, delegate=None):
+        self.controller = controller
+        self.delegate = delegate
+
+    def _apply_with_spectrum_context(self, apply_model, input_x, timestep, c):
+        transformer_options = c.setdefault("transformer_options", {})
+
+        if transformer_options.get(_SOLVER_STEP_ID_KEY) is None:
+            self.controller._ensure_step_context(
+                transformer_options=transformer_options,
+                sigma=timestep,
+                run_token_fallback=("transformer_options", id(transformer_options)),
+                reuse_active_step=True,
+            )
+
+        if self.controller.runtime.cfg.debug:
+            print(
+                "[Spectrum SDXL] model_wrapper "
+                f"run={transformer_options.get(_RUN_ID_KEY)} "
+                f"step={transformer_options.get(_SOLVER_STEP_ID_KEY)} "
+                f"time={transformer_options.get(_TIME_COORD_KEY)} "
+                f"total={transformer_options.get(_TOTAL_STEPS_KEY)}"
+            )
+
+        return apply_model(input_x, timestep, **c)
+
+    def __call__(self, apply_model, args):
+        def spectrum_apply_model(input_x, timestep, **c):
+            return self._apply_with_spectrum_context(apply_model, input_x, timestep, c)
+
+        if self.delegate is not None:
+            return self.delegate(spectrum_apply_model, args)
+        return spectrum_apply_model(args["input"], args["timestep"], **args["c"])
+
+
 def _install_outer_step_controller(model: Any, runtime: SpectrumSDXLRuntime) -> None:
     """Install the sampler-layer outer-step controller on the patched model."""
     model_options = _ensure_model_options(model)
@@ -200,6 +271,28 @@ def _install_outer_step_controller(model: Any, runtime: SpectrumSDXLRuntime) -> 
     controller = _SpectrumOuterStepController(runtime=runtime, delegate=previous)
     model_options[_OUTER_STEP_CONTROLLER_KEY] = controller
     model_options["sampler_calc_cond_batch_function"] = controller
+
+
+def _install_model_function_wrapper(model: Any, controller: _SpectrumOuterStepController) -> None:
+    """Install the compat wrapper for guider paths that call ``apply_model`` directly."""
+    model_options = _ensure_model_options(model)
+    wrapper = model_options.get(_MODEL_FUNCTION_WRAPPER_KEY)
+    current = model_options.get("model_function_wrapper")
+
+    if isinstance(current, _SpectrumModelFunctionWrapper) and wrapper is None:
+        wrapper = current
+
+    if isinstance(wrapper, _SpectrumModelFunctionWrapper):
+        wrapper.controller = controller
+        if current is not wrapper:
+            wrapper.delegate = current
+        model_options[_MODEL_FUNCTION_WRAPPER_KEY] = wrapper
+        model_options["model_function_wrapper"] = wrapper
+        return
+
+    wrapper = _SpectrumModelFunctionWrapper(controller=controller, delegate=current)
+    model_options[_MODEL_FUNCTION_WRAPPER_KEY] = wrapper
+    model_options["model_function_wrapper"] = wrapper
 
 
 def _wrap_sdxl_unet_forward(inner: Any) -> None:
@@ -392,6 +485,9 @@ class SDXLSpectrumPatcher:
         tr_opts["spectrum_sdxl_cfg_dict"] = asdict(cfg)
 
         _install_outer_step_controller(patched, runtime)
+        controller = patched.model_options.get(_OUTER_STEP_CONTROLLER_KEY)
+        if isinstance(controller, _SpectrumOuterStepController):
+            _install_model_function_wrapper(patched, controller)
 
         inner, inner_name = _locate_unet_inner_model(patched)
         runtime.last_info["hook_target"] = inner_name
