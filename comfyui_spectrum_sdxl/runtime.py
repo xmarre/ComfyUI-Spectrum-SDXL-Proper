@@ -183,6 +183,14 @@ class SpectrumSDXLRuntime:
         """Return the current sampler length in diffusion steps."""
         return max(int(self.last_info.get("num_steps", 0)), 1)
 
+    def _is_tail_actual_step(self, solver_step_id: int, total_steps: int) -> bool:
+        """Return whether this solver step is forced to stay on the real path."""
+        tail_actual_steps = int(self.cfg.tail_actual_steps)
+        if tail_actual_steps <= 0:
+            return False
+        tail_start = max(0, int(total_steps) - tail_actual_steps)
+        return int(solver_step_id) >= tail_start
+
     def stream_key(
         self,
         transformer_options: Dict[str, Any],
@@ -304,13 +312,20 @@ class SpectrumSDXLRuntime:
         state.local_step_count += 1
 
         actual_forward = ctx["actual_forward"]
+        tail_actual_only = self._is_tail_actual_step(ctx["solver_step_id"], ctx["total_steps"])
         if actual_forward is None:
             actual_forward = True
-            if ctx["solver_step_id"] >= self.cfg.warmup_steps:
+            if (
+                ctx["solver_step_id"] >= self.cfg.warmup_steps
+                and not tail_actual_only
+            ):
                 ws_floor = max(1, int(math.floor(state.curr_ws)))
                 actual_forward = ((state.num_consecutive_cached_steps + 1) % ws_floor) == 0
 
-        forecast_safe = not self._forecast_disabled
+        if tail_actual_only:
+            actual_forward = True
+
+        forecast_safe = not self._forecast_disabled and not tail_actual_only
         if (not actual_forward) and (not state.forecaster.ready()):
             actual_forward = True
             forecast_safe = False
