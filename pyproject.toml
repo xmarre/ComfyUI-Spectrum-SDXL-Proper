@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-spectrum-sdxl-proper"
-version = "0.1.8"
+version = "0.1.9"
 description = "Native ComfyUI SDXL Spectrum forecaster node with proper internal U-Net integration"
 readme = "README.md"
 requires-python = ">=3.10"
