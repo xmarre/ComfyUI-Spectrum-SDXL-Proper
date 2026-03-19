@@ -346,7 +346,7 @@ class SpectrumSDXLRuntime:
                 ws_floor = max(1, int(math.floor(state.curr_ws)))
                 actual_forward = ((state.num_consecutive_cached_steps + 1) % ws_floor) == 0
 
-        if tail_actual_only:
+        if self._forecast_disabled or tail_actual_only:
             actual_forward = True
 
         forecast_safe = not self._forecast_disabled and not tail_actual_only

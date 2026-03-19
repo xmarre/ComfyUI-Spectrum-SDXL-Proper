@@ -221,6 +221,23 @@ def test_outer_step_controller_uses_schedule_time_coord() -> None:
     assert torch.allclose(torch.tensor(second["spectrum_time_coord"]), torch.tensor(0.12), atol=1e-6)
 
 
+def test_outer_step_controller_preserves_normalized_ordinal_fallback_without_sample_sigmas() -> None:
+    """Without sample_sigmas, fallback coordinates must stay in normalized ordinal space."""
+    runtime = SpectrumSDXLRuntime(_make_cfg())
+    runtime.last_info["num_steps"] = 5
+    model_options = {"transformer_options": {}}
+    controller = _SpectrumOuterStepController(
+        runtime=runtime,
+        delegate=lambda args: args["model_options"]["transformer_options"].copy(),
+    )
+
+    first = controller({"model_options": model_options, "sigma": torch.tensor([1.0])})
+    second = controller({"model_options": model_options, "sigma": torch.tensor([0.5])})
+
+    assert torch.allclose(torch.tensor(first["spectrum_time_coord"]), torch.tensor(-1.0), atol=1e-6)
+    assert torch.allclose(torch.tensor(second["spectrum_time_coord"]), torch.tensor(-0.5), atol=1e-6)
+
+
 def test_runtime_disables_forecasting_when_time_coord_does_not_match_schedule() -> None:
     """A mismatched controller time axis must fail open instead of forecasting."""
     runtime = SpectrumSDXLRuntime(_make_cfg())
@@ -692,6 +709,7 @@ def main() -> None:
     test_outer_step_controller_injects_context_and_resets_runs()
     test_outer_step_controller_same_object_restart_resets_run_state()
     test_outer_step_controller_uses_schedule_time_coord()
+    test_outer_step_controller_preserves_normalized_ordinal_fallback_without_sample_sigmas()
     test_model_function_wrapper_injects_context_for_bypassed_guider_path()
     test_model_function_wrapper_reuses_solver_step_for_repeated_same_sigma_subcalls()
     test_model_function_wrapper_same_object_restart_resets_run_state()
