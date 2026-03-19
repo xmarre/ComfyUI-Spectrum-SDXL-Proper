@@ -16,6 +16,7 @@ class SpectrumSDXLConfig:
     window_size: float = 2.0
     flex_window: float = 0.75
     warmup_steps: int = 5
+    tail_actual_steps: int = 3
     history_size: int = 100
     debug: bool = False
 
@@ -33,6 +34,8 @@ class SpectrumSDXLConfig:
             raise ValueError("flex_window must be >= 0.")
         if int(self.warmup_steps) < 0:
             raise ValueError("warmup_steps must be >= 0.")
+        if int(self.tail_actual_steps) < 0:
+            raise ValueError("tail_actual_steps must be >= 0.")
         if int(self.history_size) < 2:
             raise ValueError("history_size must be >= 2.")
         return self

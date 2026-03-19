@@ -50,9 +50,10 @@ Inputs:
 - `window_size`
 - `flex_window`
 - `warmup_steps`
+- `tail_actual_steps`
 - `debug`
 
-`window_size`, `flex_window`, and `warmup_steps` are now consumed by the built-in outer-step controller path. External controllers can also provide explicit per-step decisions through `spectrum_actual_forward`.
+`window_size`, `flex_window`, and `warmup_steps` are now consumed by the built-in outer-step controller path. `tail_actual_steps` reserves the last `N` solver steps for real forwards only, even if forecasting history is ready. Set it to `0` to preserve the older behavior with no protected real tail. External controllers can also provide explicit per-step decisions through `spectrum_actual_forward`, but the runtime still forces the protected tail onto the real path.
 
 ## Usage
 
@@ -92,6 +93,7 @@ The smoke suite covers:
 - explicit-context forecasting
 - outer-step controller context injection
 - run-id-based state reset
+- protected real-tail enforcement, including `tail_actual_steps >= total_steps`
 
 Expected output:
 

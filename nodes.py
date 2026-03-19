@@ -22,6 +22,7 @@ class SpectrumApplySDXL:
                 "window_size": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 32.0, "step": 0.05}),
                 "flex_window": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 16.0, "step": 0.05}),
                 "warmup_steps": ("INT", {"default": 5, "min": 0, "max": 64, "step": 1}),
+                "tail_actual_steps": ("INT", {"default": 3, "min": 0, "max": 64, "step": 1}),
                 "debug": ("BOOLEAN", {"default": False}),
             }
         }
@@ -41,6 +42,7 @@ class SpectrumApplySDXL:
         window_size,
         flex_window,
         warmup_steps,
+        tail_actual_steps,
         debug,
     ):
         """Validate node parameters and return a patched ComfyUI model."""
@@ -55,6 +57,7 @@ class SpectrumApplySDXL:
             window_size=window_size,
             flex_window=flex_window,
             warmup_steps=warmup_steps,
+            tail_actual_steps=tail_actual_steps,
             debug=debug,
         ).validated()
         return (SDXLSpectrumPatcher.patch(model, cfg),)

@@ -331,6 +331,104 @@ def test_chebyshev_prediction_varies_with_time_coord() -> None:
     assert torch.allclose(pred_three, torch.tensor([3.0]), atol=1e-5)
 
 
+def test_tail_actual_steps_force_real_tail_even_with_ready_history() -> None:
+    """The configured tail must stay on the real path even when forecasting is ready."""
+    cfg = _make_cfg()
+    cfg.tail_actual_steps = 1
+    runtime = SpectrumSDXLRuntime(cfg.validated())
+
+    first = runtime.begin_step(_step_options("run-a", 0, 0.0, True, total_steps=5), torch.tensor([0.0]), (2, 8, 4, 4))
+    runtime.observe_actual_feature(
+        first["stream_key"],
+        first["solver_step_id"],
+        torch.full((2, 8, 4, 4), 1.0, dtype=torch.float16),
+    )
+
+    second = runtime.begin_step(_step_options("run-a", 1, 1.0, True, total_steps=5), torch.tensor([1.0]), (2, 8, 4, 4))
+    runtime.observe_actual_feature(
+        second["stream_key"],
+        second["solver_step_id"],
+        torch.full((2, 8, 4, 4), 2.0, dtype=torch.float16),
+    )
+
+    third = runtime.begin_step(_step_options("run-a", 2, 2.0, False, total_steps=5), torch.tensor([2.0]), (2, 8, 4, 4))
+    assert third["solver_step_id"] == 2
+    assert third["actual_forward"] is False
+    assert third["forecast_safe"] is True
+    runtime.finalize_step(third["stream_key"], third["solver_step_id"], used_forecast=True)
+
+    fourth = runtime.begin_step(_step_options("run-a", 3, 3.0, False, total_steps=5), torch.tensor([3.0]), (2, 8, 4, 4))
+    assert fourth["solver_step_id"] == 3
+    assert fourth["actual_forward"] is False
+    assert fourth["forecast_safe"] is True
+    runtime.finalize_step(fourth["stream_key"], fourth["solver_step_id"], used_forecast=True)
+
+    fifth = runtime.begin_step(_step_options("run-a", 4, 4.0, False, total_steps=5), torch.tensor([4.0]), (2, 8, 4, 4))
+    assert fifth["solver_step_id"] == 4
+    assert fifth["actual_forward"] is True
+    assert fifth["forecast_safe"] is False
+
+
+def test_tail_actual_steps_zero_preserves_existing_scheduler_behavior() -> None:
+    """Disabling the tail override must keep the old scheduling path intact."""
+    cfg = _make_cfg()
+    cfg.tail_actual_steps = 0
+    runtime = SpectrumSDXLRuntime(cfg.validated())
+
+    first = runtime.begin_step(_step_options("run-a", 0, 0.0, True, total_steps=5), torch.tensor([0.0]), (2, 8, 4, 4))
+    runtime.observe_actual_feature(
+        first["stream_key"],
+        first["solver_step_id"],
+        torch.full((2, 8, 4, 4), 1.0, dtype=torch.float16),
+    )
+
+    second = runtime.begin_step(_step_options("run-a", 1, 1.0, True, total_steps=5), torch.tensor([1.0]), (2, 8, 4, 4))
+    runtime.observe_actual_feature(
+        second["stream_key"],
+        second["solver_step_id"],
+        torch.full((2, 8, 4, 4), 2.0, dtype=torch.float16),
+    )
+
+    third = runtime.begin_step(_step_options("run-a", 2, 2.0, False, total_steps=5), torch.tensor([2.0]), (2, 8, 4, 4))
+    assert third["solver_step_id"] == 2
+    assert third["actual_forward"] is False
+    assert third["forecast_safe"] is True
+    runtime.finalize_step(third["stream_key"], third["solver_step_id"], used_forecast=True)
+
+    fourth = runtime.begin_step(_step_options("run-a", 3, 3.0, False, total_steps=5), torch.tensor([3.0]), (2, 8, 4, 4))
+    assert fourth["solver_step_id"] == 3
+    assert fourth["actual_forward"] is False
+    assert fourth["forecast_safe"] is True
+    runtime.finalize_step(fourth["stream_key"], fourth["solver_step_id"], used_forecast=True)
+
+    fifth = runtime.begin_step(_step_options("run-a", 4, 4.0, False, total_steps=5), torch.tensor([4.0]), (2, 8, 4, 4))
+    assert fifth["solver_step_id"] == 4
+    assert fifth["actual_forward"] is False
+    assert fifth["forecast_safe"] is True
+
+
+def test_tail_actual_steps_greater_than_total_steps_forces_all_steps_real() -> None:
+    """A tail longer than the schedule must force every step onto the real path."""
+    cfg = _make_cfg()
+    cfg.tail_actual_steps = 10
+    runtime = SpectrumSDXLRuntime(cfg.validated())
+
+    for solver_step_id in range(5):
+        step = runtime.begin_step(
+            _step_options("run-a", solver_step_id, float(solver_step_id), False, total_steps=5),
+            torch.tensor([float(solver_step_id)]),
+            (2, 8, 4, 4),
+        )
+        assert step["solver_step_id"] == solver_step_id
+        assert step["actual_forward"] is True
+        assert step["forecast_safe"] is False
+        runtime.observe_actual_feature(
+            step["stream_key"],
+            step["solver_step_id"],
+            torch.full((2, 8, 4, 4), float(solver_step_id + 1), dtype=torch.float16),
+        )
+
+
 def main() -> None:
     """Run the lightweight regression suite without external test tooling."""
     test_missing_solver_step_context_fails_open()
@@ -347,6 +445,9 @@ def main() -> None:
     test_run_id_switch_resets_stream_state()
     test_forecaster_uses_schedule_coordinates_not_ordinal_step_index()
     test_chebyshev_prediction_varies_with_time_coord()
+    test_tail_actual_steps_force_real_tail_even_with_ready_history()
+    test_tail_actual_steps_zero_preserves_existing_scheduler_behavior()
+    test_tail_actual_steps_greater_than_total_steps_forces_all_steps_real()
     print("ok")
 
 
