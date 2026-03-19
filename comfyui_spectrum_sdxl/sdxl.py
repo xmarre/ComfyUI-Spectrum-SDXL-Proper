@@ -162,6 +162,17 @@ class _SpectrumOuterStepController:
     def __call__(self, args):
         model_options = args["model_options"]
         self._ensure_outer_step_context(args)
+        if self.runtime.cfg.debug:
+            transformer_options = model_options.get("transformer_options", {})
+            print(
+                "[Spectrum SDXL] controller "
+                f"run={transformer_options.get(_RUN_ID_KEY)} "
+                f"step={transformer_options.get(_SOLVER_STEP_ID_KEY)} "
+                f"time={transformer_options.get(_TIME_COORD_KEY)} "
+                f"total={transformer_options.get(_TOTAL_STEPS_KEY)} "
+                f"model_options_id={id(model_options)} "
+                f"transformer_options_id={id(transformer_options)}"
+            )
         if self.delegate is not None:
             return self.delegate(args)
 
@@ -214,6 +225,18 @@ def _wrap_sdxl_unet_forward(inner: Any) -> None:
 
         if transformer_options is None:
             transformer_options = {}
+
+        if runtime.cfg.debug:
+            print(
+                "[Spectrum SDXL] unet "
+                f"run={transformer_options.get(_RUN_ID_KEY)} "
+                f"step={transformer_options.get(_SOLVER_STEP_ID_KEY)} "
+                f"time={transformer_options.get(_TIME_COORD_KEY)} "
+                f"total={transformer_options.get(_TOTAL_STEPS_KEY)} "
+                f"transformer_options_id={id(transformer_options)} "
+                f"stream_key_present="
+                f"{runtime.stream_key(transformer_options, tuple(int(v) for v in x.shape)) is not None}"
+            )
 
         from comfy.ldm.modules.diffusionmodules.openaimodel import (
             apply_control,
