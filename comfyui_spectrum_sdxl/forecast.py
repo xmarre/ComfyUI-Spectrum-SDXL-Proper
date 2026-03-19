@@ -10,12 +10,11 @@ import torch
 
 @dataclass
 class _FitCache:
-    """Cached regression fit for a fixed sampler length."""
+    """Cached regression fit for the current coordinate history."""
 
     coeff: torch.Tensor
     feature_shape: torch.Size
     feature_dtype: torch.dtype
-    total_steps: int
 
 
 class ChebyshevFeatureForecaster:
@@ -24,8 +23,8 @@ class ChebyshevFeatureForecaster:
 
     The predictor fits a Chebyshev basis with ridge regularization over
     observed hidden features, then blends that forecast with a local
-    first-order extrapolation. Time is normalized against the current sampler
-    length rather than a hard-coded schedule.
+    first-order extrapolation. It assumes the provided ``time_coord`` values
+    are already in a common schedule-coordinate space.
     """
 
     def __init__(self, degree: int, ridge_lambda: float, blend_weight: float, history_size: int = 100):
@@ -66,10 +65,9 @@ class ChebyshevFeatureForecaster:
             self.history.pop(0)
         self._fit_cache = None
 
-    def _tau(self, time_values: torch.Tensor, total_steps: int) -> torch.Tensor:
-        """Map solver-step coordinates to the Chebyshev domain ``[-1, 1]``."""
-        denom = max(int(total_steps) - 1, 1)
-        return (time_values.to(torch.float32) / float(denom)) * 2.0 - 1.0
+    def _coords(self, time_values: torch.Tensor) -> torch.Tensor:
+        """Return schedule coordinates in the Chebyshev domain ``[-1, 1]``."""
+        return time_values.to(torch.float32)
 
     def _design(self, taus: torch.Tensor, degree: int) -> torch.Tensor:
         """Construct the Chebyshev design matrix up to the requested degree."""
@@ -81,10 +79,9 @@ class ChebyshevFeatureForecaster:
             cols.append(2.0 * taus.to(torch.float32) * cols[-1] - cols[-2])
         return torch.cat(cols[: degree + 1], dim=1)
 
-    def _fit_if_needed(self, total_steps: int) -> None:
+    def _fit_if_needed(self) -> None:
         """Fit ridge-regression coefficients if the cache is stale."""
-        total_steps = int(total_steps)
-        if self._fit_cache is not None and self._fit_cache.total_steps == total_steps:
+        if self._fit_cache is not None:
             return
         if not self.history:
             raise RuntimeError("Spectrum forecaster was asked to fit without history.")
@@ -94,7 +91,7 @@ class ChebyshevFeatureForecaster:
 
         device = self._feature_device
         time_tensor = torch.tensor([t for t, _ in self.history], device=device, dtype=torch.float32)
-        taus = self._tau(time_tensor, total_steps)
+        taus = self._coords(time_tensor)
         x_mat = self._design(taus, self.degree)
         h_mat = torch.stack([feat.reshape(-1).to(torch.float32) for _, feat in self.history], dim=0)
 
@@ -115,15 +112,13 @@ class ChebyshevFeatureForecaster:
             coeff=coeff,
             feature_shape=self._feature_shape,
             feature_dtype=self._feature_dtype,
-            total_steps=total_steps,
         )
 
-    def _predict_chebyshev(self, time_coord: float, total_steps: int) -> torch.Tensor:
+    def _predict_chebyshev(self, time_coord: float) -> torch.Tensor:
         """Predict a feature using only the fitted Chebyshev basis."""
         assert self._fit_cache is not None
-        tau_star = self._tau(
+        tau_star = self._coords(
             torch.tensor([float(time_coord)], device=self._fit_cache.coeff.device, dtype=torch.float32),
-            total_steps,
         )
         x_star = self._design(tau_star, self.degree)
         pred = (x_star @ self._fit_cache.coeff).reshape(self._fit_cache.feature_shape)
@@ -148,13 +143,14 @@ class ChebyshevFeatureForecaster:
 
     def predict(self, time_coord: float, total_steps: int) -> torch.Tensor:
         """Predict the hidden feature for a future solver-step coordinate."""
+        del total_steps
         if not self.history:
             raise RuntimeError("Spectrum forecaster was asked to predict without history.")
         if len(self.history) == 1:
             return self.history[-1][1]
 
-        self._fit_if_needed(total_steps)
-        cheb = self._predict_chebyshev(time_coord, total_steps)
+        self._fit_if_needed()
+        cheb = self._predict_chebyshev(time_coord)
         lin = self._predict_linear(time_coord)
         out = (1.0 - self.blend_weight) * lin + self.blend_weight * cheb
 
