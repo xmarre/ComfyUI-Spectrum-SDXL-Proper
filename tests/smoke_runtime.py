@@ -419,6 +419,39 @@ def test_model_function_wrapper_injects_context_for_delegate_internal_apply_call
     assert first["spectrum_run_id"] == second["spectrum_run_id"] == third["spectrum_run_id"]
 
 
+def test_model_function_wrapper_delegate_forces_actual_forward_flag() -> None:
+    """Delegated guider paths must be forced onto real forwards to avoid forecast aliasing."""
+    runtime = SpectrumSDXLRuntime(_make_cfg())
+    controller = _SpectrumOuterStepController(runtime=runtime)
+
+    seen = {}
+
+    def apply_model(input_x, timestep, **c):
+        del input_x, timestep
+        seen.update(c["transformer_options"])
+        return 0
+
+    def delegate(wrapped_apply_model, args):
+        options = args["c"]["transformer_options"]
+        return wrapped_apply_model(
+            args["input"],
+            args["timestep"],
+            transformer_options={"sample_sigmas": options["sample_sigmas"]},
+        )
+
+    wrapper = _SpectrumModelFunctionWrapper(controller=controller, delegate=delegate)
+    wrapper(
+        apply_model,
+        {
+            "c": {"transformer_options": {"sample_sigmas": torch.tensor([14.0, 7.0, 1.5, 0.0])}},
+            "timestep": torch.tensor([14.0]),
+            "input": torch.zeros((1, 4, 8, 8)),
+        },
+    )
+
+    assert seen["spectrum_actual_forward"] is True
+
+
 def test_forecast_request_before_history_fails_open_per_step() -> None:
     """Outer code may request a forecast early; the runtime must still fail open."""
     runtime = SpectrumSDXLRuntime(_make_cfg())
@@ -642,6 +675,7 @@ def main() -> None:
     test_model_function_wrapper_same_object_restart_resets_run_state()
     test_model_function_wrapper_preserves_existing_context()
     test_model_function_wrapper_injects_context_for_delegate_internal_apply_calls()
+    test_model_function_wrapper_delegate_forces_actual_forward_flag()
     test_forecast_request_before_history_fails_open_per_step()
     test_duplicate_actual_updates_are_deduped()
     test_forecast_fallback_commits_actual_bookkeeping()

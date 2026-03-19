@@ -238,13 +238,20 @@ class _SpectrumModelFunctionWrapper:
                 reuse_active_step=True,
             )
 
+        # Delegated guider paths (for example AutoGuidance) can issue multiple distinct
+        # same-step apply_model calls without exposing stable inner-branch identity.
+        # Force the runtime onto the real path to avoid forecast stream aliasing.
+        if self.delegate is not None:
+            transformer_options["spectrum_actual_forward"] = True
+
         if self.controller.runtime.cfg.debug:
             print(
                 "[Spectrum SDXL] model_wrapper "
                 f"run={transformer_options.get(_RUN_ID_KEY)} "
                 f"step={transformer_options.get(_SOLVER_STEP_ID_KEY)} "
                 f"time={transformer_options.get(_TIME_COORD_KEY)} "
-                f"total={transformer_options.get(_TOTAL_STEPS_KEY)}"
+                f"total={transformer_options.get(_TOTAL_STEPS_KEY)} "
+                f"forced_actual={transformer_options.get('spectrum_actual_forward', None)}"
             )
 
         return apply_model(input_x, timestep, **c)
