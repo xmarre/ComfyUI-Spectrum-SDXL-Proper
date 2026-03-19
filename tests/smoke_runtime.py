@@ -195,11 +195,11 @@ def test_outer_step_controller_same_object_restart_resets_run_state() -> None:
     assert second["spectrum_solver_step_id"] == 1
     assert restarted["spectrum_run_id"] != first["spectrum_run_id"]
     assert restarted["spectrum_solver_step_id"] == 0
-    assert restarted["spectrum_time_coord"] == 0.0
+    assert torch.allclose(torch.tensor(restarted["spectrum_time_coord"]), torch.tensor(-1.0), atol=1e-6)
 
 
-def test_outer_step_controller_uses_ordinal_time_coord() -> None:
-    """The controller must keep time_coord in the same ordinal step space as the forecaster."""
+def test_outer_step_controller_uses_schedule_time_coord() -> None:
+    """The controller must keep time_coord aligned with the normalized sigma schedule."""
     runtime = SpectrumSDXLRuntime(_make_cfg())
     controller = _SpectrumOuterStepController(
         runtime=runtime,
@@ -217,8 +217,30 @@ def test_outer_step_controller_uses_ordinal_time_coord() -> None:
 
     assert first["spectrum_solver_step_id"] == 0
     assert second["spectrum_solver_step_id"] == 1
-    assert first["spectrum_time_coord"] == 0.0
-    assert second["spectrum_time_coord"] == 1.0
+    assert torch.allclose(torch.tensor(first["spectrum_time_coord"]), torch.tensor(-1.0), atol=1e-6)
+    assert torch.allclose(torch.tensor(second["spectrum_time_coord"]), torch.tensor(0.12), atol=1e-6)
+
+
+def test_runtime_disables_forecasting_when_time_coord_does_not_match_schedule() -> None:
+    """A mismatched controller time axis must fail open instead of forecasting."""
+    runtime = SpectrumSDXLRuntime(_make_cfg())
+    sample_sigmas = torch.tensor([14.0, 7.0, 1.5, 0.0], dtype=torch.float32)
+    decision = runtime.begin_step(
+        {
+            "sample_sigmas": sample_sigmas,
+            "uuids": ("u0", "u1"),
+            "cond_or_uncond": (1, 0),
+            "spectrum_run_id": "run-a",
+            "spectrum_solver_step_id": 1,
+            "spectrum_time_coord": 1.0,
+            "spectrum_total_steps": 3,
+        },
+        torch.tensor([7.0]),
+        (2, 8, 4, 4),
+    )
+    assert decision["actual_forward"] is True
+    assert decision["forecast_safe"] is False
+    assert runtime.last_info["forecast_disable_reason"] == "solver-step time_coord did not match the active schedule"
 
 
 def test_model_function_wrapper_injects_context_for_bypassed_guider_path() -> None:
@@ -336,7 +358,7 @@ def test_model_function_wrapper_same_object_restart_resets_run_state() -> None:
     assert second["spectrum_solver_step_id"] == 1
     assert restarted["spectrum_run_id"] != first["spectrum_run_id"]
     assert restarted["spectrum_solver_step_id"] == 0
-    assert restarted["spectrum_time_coord"] == 0.0
+    assert torch.allclose(torch.tensor(restarted["spectrum_time_coord"]), torch.tensor(-1.0), atol=1e-6)
 
 
 def test_model_function_wrapper_preserves_existing_context() -> None:
@@ -669,13 +691,14 @@ def main() -> None:
     test_explicit_solver_step_context_without_decision_still_schedules()
     test_outer_step_controller_injects_context_and_resets_runs()
     test_outer_step_controller_same_object_restart_resets_run_state()
-    test_outer_step_controller_uses_ordinal_time_coord()
+    test_outer_step_controller_uses_schedule_time_coord()
     test_model_function_wrapper_injects_context_for_bypassed_guider_path()
     test_model_function_wrapper_reuses_solver_step_for_repeated_same_sigma_subcalls()
     test_model_function_wrapper_same_object_restart_resets_run_state()
     test_model_function_wrapper_preserves_existing_context()
     test_model_function_wrapper_injects_context_for_delegate_internal_apply_calls()
     test_model_function_wrapper_delegate_forces_actual_forward_flag()
+    test_runtime_disables_forecasting_when_time_coord_does_not_match_schedule()
     test_forecast_request_before_history_fails_open_per_step()
     test_duplicate_actual_updates_are_deduped()
     test_forecast_fallback_commits_actual_bookkeeping()

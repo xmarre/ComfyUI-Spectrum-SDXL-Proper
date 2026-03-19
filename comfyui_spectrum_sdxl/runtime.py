@@ -142,6 +142,25 @@ class SpectrumSDXLRuntime:
 
         return max(int(self.last_info.get("num_steps", 0)), 1)
 
+    def _expected_time_coord(self, transformer_options: Dict[str, Any], solver_step_id: int) -> Optional[float]:
+        """Return the normalized schedule coordinate for one solver step when sample sigmas are available."""
+        sample_sigmas = transformer_options.get("sample_sigmas", None)
+        if sample_sigmas is None:
+            return None
+        try:
+            values = tuple(float(v) for v in sample_sigmas.detach().flatten().tolist()[:-1])
+        except Exception:
+            return None
+        if not values:
+            return None
+        idx = min(max(int(solver_step_id), 0), len(values) - 1)
+        start = values[0]
+        end = values[-1]
+        denom = end - start
+        if abs(denom) < 1e-12:
+            return 0.0
+        return float(((values[idx] - start) / denom) * 2.0 - 1.0)
+
     def _solver_step_context(self, transformer_options: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
         """Validate and extract an explicit outer-step Spectrum context."""
         run_id = transformer_options.get(_RUN_ID_KEY, None)
@@ -277,6 +296,11 @@ class SpectrumSDXLRuntime:
 
         self._ensure_run_sync(ctx["run_id"])
         self.last_info["num_steps"] = ctx["total_steps"]
+        expected_time_coord = self._expected_time_coord(transformer_options, ctx["solver_step_id"])
+        if expected_time_coord is not None and not math.isclose(
+            float(ctx["time_coord"]), float(expected_time_coord), rel_tol=0.0, abs_tol=1e-8
+        ):
+            self._disable_forecasting("solver-step time_coord did not match the active schedule")
 
         if stream_key is None:
             self._disable_forecasting("missing_stream_identity")

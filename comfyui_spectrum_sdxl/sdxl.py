@@ -85,9 +85,24 @@ class _SpectrumOuterStepController:
         self._active_step_marker = None
         self._active_solver_step_id = 0
 
-    def _extract_time_coord(self, solver_step_id: int) -> float:
-        """Keep the forecast axis aligned with the ordinal outer-step index."""
-        return float(solver_step_id)
+    def _extract_time_coord(self, transformer_options: Dict[str, Any], solver_step_id: int) -> float:
+        """Map the current solver step onto the active normalized schedule coordinate."""
+        sample_sigmas = transformer_options.get("sample_sigmas", None)
+        if sample_sigmas is None:
+            return float(solver_step_id)
+        try:
+            values = tuple(float(v) for v in sample_sigmas.detach().flatten().tolist()[:-1])
+        except Exception:
+            return float(solver_step_id)
+        if not values:
+            return float(solver_step_id)
+        idx = min(max(int(solver_step_id), 0), len(values) - 1)
+        start = values[0]
+        end = values[-1]
+        denom = end - start
+        if abs(denom) < 1e-12:
+            return 0.0
+        return float(((values[idx] - start) / denom) * 2.0 - 1.0)
 
     def _sample_sigmas_token(self, transformer_options: Dict[str, Any]):
         sample_sigmas = transformer_options.get("sample_sigmas", None)
@@ -179,7 +194,7 @@ class _SpectrumOuterStepController:
 
         transformer_options[_RUN_ID_KEY] = self._run_serial
         transformer_options[_SOLVER_STEP_ID_KEY] = solver_step_id
-        transformer_options[_TIME_COORD_KEY] = self._extract_time_coord(solver_step_id)
+        transformer_options[_TIME_COORD_KEY] = self._extract_time_coord(transformer_options, solver_step_id)
         transformer_options[_TOTAL_STEPS_KEY] = self._extract_total_steps(transformer_options)
 
     def _ensure_outer_step_context(self, args: Dict[str, Any]) -> None:
