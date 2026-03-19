@@ -202,11 +202,43 @@ class SpectrumSDXLRuntime:
         """Return the current sampler length in diffusion steps."""
         return max(int(self.last_info.get("num_steps", 0)), 1)
 
-    def _is_tail_actual_step(self, solver_step_id: int, total_steps: int) -> bool:
-        """Return whether this solver step is forced to stay on the real path."""
+    def _tail_actual_coord_threshold(self, total_steps: int) -> Optional[float]:
+        """
+        Return the normalized schedule-space threshold that starts the protected
+        real tail.
+
+        On a uniform schedule this preserves the exact old step-count semantics
+        of ``tail_actual_steps`` by placing the cut at the midpoint between the
+        last forecastable step and the first protected tail step.
+        """
         tail_actual_steps = int(self.cfg.tail_actual_steps)
         if tail_actual_steps <= 0:
+            return None
+
+        total_steps = max(int(total_steps), 1)
+        tail_start = max(0, total_steps - tail_actual_steps)
+        if total_steps <= 1:
+            return -1.0
+
+        midpoint_index = float(tail_start) - 0.5
+        threshold = -1.0 + (2.0 * midpoint_index / float(total_steps - 1))
+        return float(min(max(threshold, -1.0), 1.0))
+
+    def _is_tail_actual_step(
+        self,
+        solver_step_id: int,
+        total_steps: int,
+        time_coord: Optional[float],
+    ) -> bool:
+        """Return whether this solver step is forced to stay on the real path."""
+        threshold = self._tail_actual_coord_threshold(total_steps)
+        if threshold is None:
             return False
+
+        if time_coord is not None:
+            return float(time_coord) >= float(threshold)
+
+        tail_actual_steps = int(self.cfg.tail_actual_steps)
         tail_start = max(0, int(total_steps) - tail_actual_steps)
         return int(solver_step_id) >= tail_start
 
@@ -336,7 +368,11 @@ class SpectrumSDXLRuntime:
         state.local_step_count += 1
 
         actual_forward = ctx["actual_forward"]
-        tail_actual_only = self._is_tail_actual_step(ctx["solver_step_id"], ctx["total_steps"])
+        tail_actual_only = self._is_tail_actual_step(
+            ctx["solver_step_id"],
+            ctx["total_steps"],
+            ctx["time_coord"],
+        )
         if actual_forward is None:
             actual_forward = True
             if (
