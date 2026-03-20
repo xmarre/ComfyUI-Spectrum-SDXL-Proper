@@ -19,6 +19,7 @@ class SpectrumSDXLConfig:
     tail_actual_steps: int = 3
     history_size: int = 100
     debug: bool = False
+    min_fit_points: int = 6
 
     def validated(self) -> "SpectrumSDXLConfig":
         """Validate the configuration in place and return ``self``."""
@@ -36,6 +37,9 @@ class SpectrumSDXLConfig:
             raise ValueError("warmup_steps must be >= 0.")
         if int(self.tail_actual_steps) < 0:
             raise ValueError("tail_actual_steps must be >= 0.")
-        if int(self.history_size) < 2:
-            raise ValueError("history_size must be >= 2.")
+        if int(self.min_fit_points) < 1:
+            raise ValueError("min_fit_points must be >= 1.")
+        required_history_size = max(3, int(self.degree) + 1, int(self.min_fit_points))
+        if int(self.history_size) < required_history_size:
+            raise ValueError("history_size must be >= max(3, degree + 1, min_fit_points).")
         return self

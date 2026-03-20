@@ -51,9 +51,10 @@ Inputs:
 - `flex_window`
 - `warmup_steps`
 - `tail_actual_steps`
+- `min_fit_points`
 - `debug`
 
-`window_size`, `flex_window`, and `warmup_steps` are now consumed by the built-in outer-step controller path. `tail_actual_steps` reserves the last `N` solver steps for real forwards only, even if forecasting history is ready. Set it to `0` to preserve the older behavior with no protected real tail. External controllers can also provide explicit per-step decisions through `spectrum_actual_forward`, but the runtime still forces the protected tail onto the real path.
+`window_size`, `flex_window`, and `warmup_steps` are now consumed by the built-in outer-step controller path. `min_fit_points` sets the minimum number of actual observations required before the forecaster is even eligible; the runtime still requires at least `max(3, degree + 1, min_fit_points)` actual history points and also requires the recent one-step validation error to stay below a conservative internal threshold before a forecast can be used. `tail_actual_steps` reserves the last `N` solver steps for real forwards only, even if forecasting history is ready. Set it to `0` to preserve the older behavior with no protected real tail. External controllers can also provide explicit per-step decisions through `spectrum_actual_forward`, but the runtime still forces the protected tail onto the real path.
 
 ## Usage
 

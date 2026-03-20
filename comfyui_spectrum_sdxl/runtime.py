@@ -18,6 +18,7 @@ _RUN_ID_KEY = "spectrum_run_id"
 _SOLVER_STEP_ID_KEY = "spectrum_solver_step_id"
 _TIME_COORD_KEY = "spectrum_time_coord"
 _MODEL_TIME_COORD_KEY = "spectrum_model_time_coord"
+_MAX_RECENT_VALIDATION_REL_L2 = 0.35
 _ACTUAL_FORWARD_KEY = "spectrum_actual_forward"
 _TOTAL_STEPS_KEY = "spectrum_total_steps"
 
@@ -55,6 +56,7 @@ class SpectrumSDXLRuntime:
             degree=self.cfg.degree,
             ridge_lambda=self.cfg.ridge_lambda,
             blend_weight=self.cfg.blend_weight,
+            min_fit_points=self.cfg.min_fit_points,
             history_size=self.cfg.history_size,
         )
 
@@ -376,6 +378,7 @@ class SpectrumSDXLRuntime:
 
         actual_forward = ctx["actual_forward"]
         tail_actual_only = self._is_tail_actual_step(ctx["solver_step_id"], ctx["total_steps"])
+        recent_validation_rel_l2 = state.forecaster.recent_validation_rel_l2()
         if actual_forward is None:
             actual_forward = True
             if (
@@ -388,10 +391,14 @@ class SpectrumSDXLRuntime:
         if self._forecast_disabled or tail_actual_only:
             actual_forward = True
 
-        forecast_safe = not self._forecast_disabled and not tail_actual_only
-        if (not actual_forward) and (not state.forecaster.ready()):
+        forecast_safe = (
+            not self._forecast_disabled
+            and not tail_actual_only
+            and recent_validation_rel_l2 is not None
+            and recent_validation_rel_l2 <= _MAX_RECENT_VALIDATION_REL_L2
+        )
+        if not actual_forward and not forecast_safe:
             actual_forward = True
-            forecast_safe = False
 
         decision = {
             "global_step_idx": ctx["solver_step_id"],
@@ -403,6 +410,7 @@ class SpectrumSDXLRuntime:
             "forecast_safe": forecast_safe,
             "finalized": False,
             "time_coord": ctx["time_coord"],
+            "recent_validation_rel_l2": recent_validation_rel_l2,
             "sigma_coord": ctx["sigma_coord"],
             "total_steps": ctx["total_steps"],
         }
@@ -413,6 +421,7 @@ class SpectrumSDXLRuntime:
                 f"[Spectrum SDXL] begin "
                 f"run={ctx['run_id']} step={ctx['solver_step_id']} "
                 f"sigma={ctx['sigma_coord']} model_time={ctx['time_coord']} "
+                f"val_rel_l2={recent_validation_rel_l2} "
                 f"local={local_step_count} actual={actual_forward} "
                 f"forecast_safe={forecast_safe} ready={state.forecaster.ready()} "
                 f"ws={state.curr_ws:.3f} cached={state.num_consecutive_cached_steps} "
