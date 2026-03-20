@@ -335,13 +335,6 @@ def _wrap_sdxl_unet_forward(inner: Any) -> None:
 
     original_forward = inner._forward
 
-    non_codebook_target_head = None
-    non_codebook_projector = None
-    out_head = getattr(inner, "out", None)
-    if isinstance(out_head, torch.nn.Sequential) and len(out_head) >= 2:
-        non_codebook_target_head = out_head[:-1]
-        non_codebook_projector = out_head[-1]
-
     def _rel_l2(pred: torch.Tensor, actual: torch.Tensor) -> float:
         pred_f = pred.detach().to(torch.float32)
         actual_f = actual.detach().to(torch.float32)
@@ -360,15 +353,11 @@ def _wrap_sdxl_unet_forward(inner: Any) -> None:
 
     def _compute_non_codebook_target(h: torch.Tensor) -> torch.Tensor:
         """Return the forecast target for the normal SDXL output path."""
-        if non_codebook_target_head is None:
-            return inner.out(h)
-        return non_codebook_target_head(h)
+        return inner.out(h)
 
     def _project_non_codebook_target(feature: torch.Tensor) -> torch.Tensor:
         """Project a normal-path forecast target back to the returned denoiser output."""
-        if non_codebook_projector is None:
-            return feature
-        return non_codebook_projector(feature)
+        return feature
 
     def wrapped_forward(
         x,
@@ -588,8 +577,7 @@ def _wrap_sdxl_unet_forward(inner: Any) -> None:
                     "[Spectrum SDXL] shadow_compare "
                     f"step={solver_step_id} "
                     f"model_time={model_time} "
-                    f"target="
-                    f"{'pre_final_projection' if non_codebook_projector is not None else 'denoiser_output'} "
+                    f"target=denoiser_output "
                     f"target_rel_l2={_rel_l2(predicted_feature, actual_feature):.6f} "
                     f"target_cos={_cosine(predicted_feature, actual_feature):.6f} "
                     f"out_rel_l2={_rel_l2(pred_out, actual_out):.6f} "
