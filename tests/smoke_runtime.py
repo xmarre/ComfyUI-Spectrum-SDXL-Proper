@@ -957,6 +957,101 @@ def test_runtime_blocks_forecast_when_recent_validation_error_is_bad() -> None:
     assert blocked["recent_validation_rel_l2"] > 0.35
 
 
+def test_runtime_uses_wrapper_supplied_validation_override_when_present() -> None:
+    """A wrapper-supplied output-space validation metric should override target-space gating."""
+    runtime = SpectrumSDXLRuntime(
+        SpectrumSDXLConfig(
+            blend_weight=0.5,
+            degree=1,
+            ridge_lambda=0.1,
+            window_size=2.0,
+            flex_window=0.75,
+            warmup_steps=0,
+            tail_actual_steps=0,
+            min_fit_points=3,
+        ).validated()
+    )
+
+    last = None
+    for step_id, value in ((0, 0.0), (1, 0.0), (2, 100.0)):
+        last = runtime.begin_step(
+            _step_options("run-a", step_id, float(step_id), True, total_steps=10),
+            torch.tensor([float(step_id)]),
+            (1, 1, 1, 1),
+        )
+        runtime.observe_actual_feature(
+            last["stream_key"],
+            last["solver_step_id"],
+            torch.full((1, 1, 1, 1), value, dtype=torch.float16),
+        )
+
+    assert last is not None
+    runtime.observe_validation_rel_l2(last["stream_key"], last["solver_step_id"], 0.1)
+
+    allowed = runtime.begin_step(
+        _step_options("run-a", 3, 3.0, False, total_steps=10),
+        torch.tensor([3.0]),
+        (1, 1, 1, 1),
+    )
+    assert allowed["actual_forward"] is False
+    assert allowed["forecast_safe"] is True
+    assert allowed["recent_validation_rel_l2"] == 0.1
+
+
+def test_runtime_clears_stale_validation_override_on_newer_actual_step() -> None:
+    """An override must not leak past the actual step that produced it."""
+    runtime = SpectrumSDXLRuntime(
+        SpectrumSDXLConfig(
+            blend_weight=0.5,
+            degree=1,
+            ridge_lambda=0.1,
+            window_size=2.0,
+            flex_window=0.75,
+            warmup_steps=0,
+            tail_actual_steps=0,
+            min_fit_points=3,
+        ).validated()
+    )
+
+    decisions = []
+    for step_id, value in ((0, 0.0), (1, 0.0), (2, 100.0)):
+        decision = runtime.begin_step(
+            _step_options("run-a", step_id, float(step_id), True, total_steps=10),
+            torch.tensor([float(step_id)]),
+            (1, 1, 1, 1),
+        )
+        runtime.observe_actual_feature(
+            decision["stream_key"],
+            decision["solver_step_id"],
+            torch.full((1, 1, 1, 1), value, dtype=torch.float16),
+        )
+        decisions.append(decision)
+
+    runtime.observe_validation_rel_l2(decisions[-1]["stream_key"], decisions[-1]["solver_step_id"], 0.1)
+
+    newer = runtime.begin_step(
+        _step_options("run-a", 3, 3.0, True, total_steps=10),
+        torch.tensor([3.0]),
+        (1, 1, 1, 1),
+    )
+    runtime.observe_actual_feature(
+        newer["stream_key"],
+        newer["solver_step_id"],
+        torch.full((1, 1, 1, 1), 1000.0, dtype=torch.float16),
+    )
+
+    next_decision = runtime.begin_step(
+        _step_options("run-a", 4, 4.0, False, total_steps=10),
+        torch.tensor([4.0]),
+        (1, 1, 1, 1),
+    )
+
+    assert next_decision["recent_validation_rel_l2"] is not None
+    assert next_decision["recent_validation_rel_l2"] > 0.35
+    assert next_decision["forecast_safe"] is False
+    assert next_decision["actual_forward"] is True
+
+
 def test_chebyshev_prediction_varies_with_time_coord() -> None:
     """The pure Chebyshev branch must not collapse all future steps to one value."""
     forecaster = ChebyshevFeatureForecaster(
@@ -1404,6 +1499,8 @@ def main() -> None:
     test_runtime_uses_schedule_wide_sigma_bounds_for_forecast_fit()
     test_runtime_holds_forecasting_until_conservative_min_fit_points()
     test_runtime_blocks_forecast_when_recent_validation_error_is_bad()
+    test_runtime_uses_wrapper_supplied_validation_override_when_present()
+    test_runtime_clears_stale_validation_override_on_newer_actual_step()
     test_chebyshev_prediction_varies_with_time_coord()
     test_tail_actual_steps_force_real_tail_even_with_ready_history()
     test_tail_actual_steps_zero_preserves_existing_scheduler_behavior()

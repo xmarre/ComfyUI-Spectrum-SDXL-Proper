@@ -537,9 +537,28 @@ def _wrap_sdxl_unet_forward(inner: Any) -> None:
             actual_feature = h
             runtime.observe_actual_feature(stream_key, solver_step_id, actual_feature)
         else:
+            validation_feature = predicted_feature
+            if validation_feature is None:
+                try:
+                    validation_feature = runtime.predict_feature(stream_key, solver_step_id)
+                except Exception:
+                    validation_feature = None
+
             actual_feature = _compute_non_codebook_target(h)
-            runtime.observe_actual_feature(stream_key, solver_step_id, actual_feature)
             actual_out = _project_non_codebook_target(actual_feature)
+            if validation_feature is not None:
+                validation_feature = validation_feature.to(device=actual_feature.device, dtype=actual_feature.dtype)
+                pred_out = _project_non_codebook_target(validation_feature).to(
+                    device=actual_out.device,
+                    dtype=actual_out.dtype,
+                )
+                runtime.observe_validation_rel_l2(
+                    stream_key,
+                    solver_step_id,
+                    _rel_l2(pred_out, actual_out),
+                )
+                predicted_feature = validation_feature
+            runtime.observe_actual_feature(stream_key, solver_step_id, actual_feature)
 
         if predicted_feature is not None and runtime.cfg.debug:
             model_time = None
