@@ -254,6 +254,94 @@ def test_runtime_prefers_sigma_coord_for_forecasting_even_when_model_time_is_pre
     assert torch.allclose(torch.tensor(fit_cache.coord_max), torch.tensor(14.0), atol=1e-6)
 
 
+def test_runtime_prefers_sigma_coord_for_forecasting_without_sample_sigmas() -> None:
+    """Fallback bounds should stay on observed sigma history when schedule bounds are absent."""
+    runtime = SpectrumSDXLRuntime(_make_relaxed_cfg())
+
+    first = runtime.begin_step(
+        _step_options(
+            "run-a",
+            0,
+            14.0,
+            True,
+            total_steps=8,
+            model_time_coord=100.0,
+        ),
+        torch.tensor([100.0]),
+        (2, 8, 4, 4),
+    )
+    runtime.observe_actual_feature(
+        first["stream_key"],
+        first["solver_step_id"],
+        torch.full((2, 8, 4, 4), 1.0, dtype=torch.float16),
+    )
+
+    second = runtime.begin_step(
+        _step_options(
+            "run-a",
+            1,
+            7.0,
+            True,
+            total_steps=8,
+            model_time_coord=200.0,
+        ),
+        torch.tensor([200.0]),
+        (2, 8, 4, 4),
+    )
+    runtime.observe_actual_feature(
+        second["stream_key"],
+        second["solver_step_id"],
+        torch.full((2, 8, 4, 4), 2.0, dtype=torch.float16),
+    )
+
+    third = runtime.begin_step(
+        _step_options(
+            "run-a",
+            2,
+            3.0,
+            True,
+            total_steps=8,
+            model_time_coord=300.0,
+        ),
+        torch.tensor([300.0]),
+        (2, 8, 4, 4),
+    )
+    runtime.observe_actual_feature(
+        third["stream_key"],
+        third["solver_step_id"],
+        torch.full((2, 8, 4, 4), 3.0, dtype=torch.float16),
+    )
+
+    forecast = runtime.begin_step(
+        _step_options(
+            "run-a",
+            3,
+            1.5,
+            False,
+            total_steps=8,
+            model_time_coord=400.0,
+        ),
+        torch.tensor([400.0]),
+        (2, 8, 4, 4),
+    )
+
+    assert forecast["time_coord"] == 1.5
+    assert forecast["model_time_coord"] == 400.0
+    assert forecast["sigma_coord"] == 1.5
+    assert forecast["actual_forward"] is False
+    assert forecast["forecast_safe"] is True
+
+    pred = runtime.predict_feature(forecast["stream_key"], forecast["solver_step_id"])
+    assert pred.shape == (2, 8, 4, 4)
+    assert torch.isfinite(pred).all()
+
+    state = runtime.stream_states[forecast["stream_key"]]
+    fit_cache = state.forecaster._fit_cache
+    assert fit_cache is not None
+    assert torch.allclose(torch.tensor(fit_cache.coord_min), torch.tensor(3.0), atol=1e-6)
+    assert torch.allclose(torch.tensor(fit_cache.coord_max), torch.tensor(14.0), atol=1e-6)
+
+
 def test_explicit_solver_step_context_without_decision_still_schedules() -> None:
     """Outer-step context alone should be enough once the controller owns step ids."""
     runtime = SpectrumSDXLRuntime(_make_relaxed_cfg())
@@ -1295,6 +1383,7 @@ def main() -> None:
     test_missing_stream_identity_fails_open()
     test_explicit_solver_step_context_allows_forecast()
     test_runtime_prefers_sigma_coord_for_forecasting_even_when_model_time_is_present()
+    test_runtime_prefers_sigma_coord_for_forecasting_without_sample_sigmas()
     test_explicit_solver_step_context_without_decision_still_schedules()
     test_outer_step_controller_injects_context_and_resets_runs()
     test_outer_step_controller_same_object_restart_resets_run_state()
