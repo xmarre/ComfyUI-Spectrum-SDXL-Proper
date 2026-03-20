@@ -161,8 +161,8 @@ def test_explicit_solver_step_context_allows_forecast() -> None:
     assert runtime.last_info["forecasted_passes"] == 1
 
 
-def test_runtime_prefers_model_time_coord_for_forecasting() -> None:
-    """The forecast axis should follow model-time while sigma still validates the schedule."""
+def test_runtime_prefers_sigma_coord_for_forecasting_even_when_model_time_is_present() -> None:
+    """The forecast axis should stay on raw sigma even when model-time metadata is present."""
     runtime = SpectrumSDXLRuntime(_make_relaxed_cfg())
     sample_sigmas = torch.tensor([14.0, 7.0, 3.0, 1.5, 0.75, 0.25, 0.0], dtype=torch.float32)
 
@@ -237,7 +237,8 @@ def test_runtime_prefers_model_time_coord_for_forecasting() -> None:
         (2, 8, 4, 4),
     )
 
-    assert forecast["time_coord"] == 400.0
+    assert forecast["time_coord"] == 1.5
+    assert forecast["model_time_coord"] == 400.0
     assert forecast["sigma_coord"] == 1.5
     assert forecast["actual_forward"] is False
     assert forecast["forecast_safe"] is True
@@ -249,8 +250,96 @@ def test_runtime_prefers_model_time_coord_for_forecasting() -> None:
     state = runtime.stream_states[forecast["stream_key"]]
     fit_cache = state.forecaster._fit_cache
     assert fit_cache is not None
-    assert torch.allclose(torch.tensor(fit_cache.coord_min), torch.tensor(100.0), atol=1e-6)
-    assert torch.allclose(torch.tensor(fit_cache.coord_max), torch.tensor(400.0), atol=1e-6)
+    assert torch.allclose(torch.tensor(fit_cache.coord_min), torch.tensor(0.25), atol=1e-6)
+    assert torch.allclose(torch.tensor(fit_cache.coord_max), torch.tensor(14.0), atol=1e-6)
+
+
+def test_runtime_prefers_sigma_coord_for_forecasting_without_sample_sigmas() -> None:
+    """Fallback bounds should stay on observed sigma history when schedule bounds are absent."""
+    runtime = SpectrumSDXLRuntime(_make_relaxed_cfg())
+
+    first = runtime.begin_step(
+        _step_options(
+            "run-a",
+            0,
+            14.0,
+            True,
+            total_steps=8,
+            model_time_coord=100.0,
+        ),
+        torch.tensor([100.0]),
+        (2, 8, 4, 4),
+    )
+    runtime.observe_actual_feature(
+        first["stream_key"],
+        first["solver_step_id"],
+        torch.full((2, 8, 4, 4), 1.0, dtype=torch.float16),
+    )
+
+    second = runtime.begin_step(
+        _step_options(
+            "run-a",
+            1,
+            7.0,
+            True,
+            total_steps=8,
+            model_time_coord=200.0,
+        ),
+        torch.tensor([200.0]),
+        (2, 8, 4, 4),
+    )
+    runtime.observe_actual_feature(
+        second["stream_key"],
+        second["solver_step_id"],
+        torch.full((2, 8, 4, 4), 2.0, dtype=torch.float16),
+    )
+
+    third = runtime.begin_step(
+        _step_options(
+            "run-a",
+            2,
+            3.0,
+            True,
+            total_steps=8,
+            model_time_coord=300.0,
+        ),
+        torch.tensor([300.0]),
+        (2, 8, 4, 4),
+    )
+    runtime.observe_actual_feature(
+        third["stream_key"],
+        third["solver_step_id"],
+        torch.full((2, 8, 4, 4), 3.0, dtype=torch.float16),
+    )
+
+    forecast = runtime.begin_step(
+        _step_options(
+            "run-a",
+            3,
+            1.5,
+            False,
+            total_steps=8,
+            model_time_coord=400.0,
+        ),
+        torch.tensor([400.0]),
+        (2, 8, 4, 4),
+    )
+
+    assert forecast["time_coord"] == 1.5
+    assert forecast["model_time_coord"] == 400.0
+    assert forecast["sigma_coord"] == 1.5
+    assert forecast["actual_forward"] is False
+    assert forecast["forecast_safe"] is True
+
+    pred = runtime.predict_feature(forecast["stream_key"], forecast["solver_step_id"])
+    assert pred.shape == (2, 8, 4, 4)
+    assert torch.isfinite(pred).all()
+
+    state = runtime.stream_states[forecast["stream_key"]]
+    fit_cache = state.forecaster._fit_cache
+    assert fit_cache is not None
+    assert torch.allclose(torch.tensor(fit_cache.coord_min), torch.tensor(3.0), atol=1e-6)
+    assert torch.allclose(torch.tensor(fit_cache.coord_max), torch.tensor(14.0), atol=1e-6)
 
 
 def test_explicit_solver_step_context_without_decision_still_schedules() -> None:
@@ -704,6 +793,25 @@ def test_forecaster_chebyshev_fit_falls_back_to_observed_sigma_range() -> None:
     assert torch.allclose(torch.tensor(forecaster._fit_cache.coord_min), torch.tensor(9.0), atol=1e-6)
     assert torch.allclose(torch.tensor(forecaster._fit_cache.coord_max), torch.tensor(10.0), atol=1e-6)
     assert torch.isfinite(pred).all()
+
+
+def test_runtime_fallback_coord_bounds_ignore_unobserved_candidate_step() -> None:
+    """Fallback bounds must come only from observed feature history, not pending steps."""
+    runtime = SpectrumSDXLRuntime(_make_relaxed_cfg())
+
+    first = runtime.begin_step(_step_options("run-a", 0, 10.0, True), torch.tensor([10.0]), (1, 1, 1, 1))
+    runtime.observe_actual_feature(
+        first["stream_key"],
+        first["solver_step_id"],
+        torch.full((1, 1, 1, 1), 10.0, dtype=torch.float16),
+    )
+
+    second = runtime.begin_step(_step_options("run-a", 1, 1.0, True), torch.tensor([1.0]), (1, 1, 1, 1))
+    state = runtime.stream_states[second["stream_key"]]
+
+    assert state.forecaster._coord_bounds is not None
+    assert torch.allclose(torch.tensor(state.forecaster._coord_bounds[0]), torch.tensor(10.0), atol=1e-6)
+    assert torch.allclose(torch.tensor(state.forecaster._coord_bounds[1]), torch.tensor(10.0), atol=1e-6)
 
 
 def test_runtime_uses_schedule_wide_sigma_bounds_for_forecast_fit() -> None:
@@ -1274,7 +1382,8 @@ def main() -> None:
     test_invalid_solver_step_context_fails_open()
     test_missing_stream_identity_fails_open()
     test_explicit_solver_step_context_allows_forecast()
-    test_runtime_prefers_model_time_coord_for_forecasting()
+    test_runtime_prefers_sigma_coord_for_forecasting_even_when_model_time_is_present()
+    test_runtime_prefers_sigma_coord_for_forecasting_without_sample_sigmas()
     test_explicit_solver_step_context_without_decision_still_schedules()
     test_outer_step_controller_injects_context_and_resets_runs()
     test_outer_step_controller_same_object_restart_resets_run_state()
@@ -1291,6 +1400,7 @@ def main() -> None:
     test_forecast_fallback_commits_actual_bookkeeping()
     test_run_id_switch_resets_stream_state()
     test_forecaster_chebyshev_fit_falls_back_to_observed_sigma_range()
+    test_runtime_fallback_coord_bounds_ignore_unobserved_candidate_step()
     test_runtime_uses_schedule_wide_sigma_bounds_for_forecast_fit()
     test_runtime_holds_forecasting_until_conservative_min_fit_points()
     test_runtime_blocks_forecast_when_recent_validation_error_is_bad()
