@@ -143,7 +143,7 @@ class SpectrumSDXLRuntime:
         return max(int(self.last_info.get("num_steps", 0)), 1)
 
     def _expected_time_coord(self, transformer_options: Dict[str, Any], solver_step_id: int) -> Optional[float]:
-        """Return the normalized schedule coordinate for one solver step when sample sigmas are available."""
+        """Return the raw sigma coordinate for one solver step when sample sigmas are available."""
         sample_sigmas = transformer_options.get("sample_sigmas", None)
         if sample_sigmas is None:
             return None
@@ -154,12 +154,20 @@ class SpectrumSDXLRuntime:
         if not values:
             return None
         idx = min(max(int(solver_step_id), 0), len(values) - 1)
-        start = values[0]
-        end = values[-1]
-        denom = end - start
-        if abs(denom) < 1e-12:
-            return 0.0
-        return float(((values[idx] - start) / denom) * 2.0 - 1.0)
+        return float(values[idx])
+
+    def _schedule_coord_bounds(self, transformer_options: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+        """Return the active schedule-wide sigma span when sample sigmas are available."""
+        sample_sigmas = transformer_options.get("sample_sigmas", None)
+        if sample_sigmas is None:
+            return None
+        try:
+            values = tuple(float(v) for v in sample_sigmas.detach().flatten().tolist()[:-1])
+        except Exception:
+            return None
+        if not values:
+            return None
+        return float(min(values)), float(max(values))
 
     def _solver_step_context(self, transformer_options: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
         """Validate and extract an explicit outer-step Spectrum context."""
@@ -202,43 +210,11 @@ class SpectrumSDXLRuntime:
         """Return the current sampler length in diffusion steps."""
         return max(int(self.last_info.get("num_steps", 0)), 1)
 
-    def _tail_actual_coord_threshold(self, total_steps: int) -> Optional[float]:
-        """
-        Return the normalized schedule-space threshold that starts the protected
-        real tail.
-
-        On a uniform schedule this preserves the exact old step-count semantics
-        of ``tail_actual_steps`` by placing the cut at the midpoint between the
-        last forecastable step and the first protected tail step.
-        """
+    def _is_tail_actual_step(self, solver_step_id: int, total_steps: int) -> bool:
+        """Return whether this solver step is forced to stay on the real path."""
         tail_actual_steps = int(self.cfg.tail_actual_steps)
         if tail_actual_steps <= 0:
-            return None
-
-        total_steps = max(int(total_steps), 1)
-        tail_start = max(0, total_steps - tail_actual_steps)
-        if total_steps <= 1:
-            return -1.0
-
-        midpoint_index = float(tail_start) - 0.5
-        threshold = -1.0 + (2.0 * midpoint_index / float(total_steps - 1))
-        return float(min(max(threshold, -1.0), 1.0))
-
-    def _is_tail_actual_step(
-        self,
-        solver_step_id: int,
-        total_steps: int,
-        time_coord: Optional[float],
-    ) -> bool:
-        """Return whether this solver step is forced to stay on the real path."""
-        threshold = self._tail_actual_coord_threshold(total_steps)
-        if threshold is None:
             return False
-
-        if time_coord is not None:
-            return float(time_coord) >= float(threshold)
-
-        tail_actual_steps = int(self.cfg.tail_actual_steps)
         tail_start = max(0, int(total_steps) - tail_actual_steps)
         return int(solver_step_id) >= tail_start
 
@@ -330,7 +306,7 @@ class SpectrumSDXLRuntime:
         self.last_info["num_steps"] = ctx["total_steps"]
         expected_time_coord = self._expected_time_coord(transformer_options, ctx["solver_step_id"])
         if expected_time_coord is not None and not math.isclose(
-            float(ctx["time_coord"]), float(expected_time_coord), rel_tol=0.0, abs_tol=1e-8
+            float(ctx["time_coord"]), float(expected_time_coord), rel_tol=1e-6, abs_tol=1e-6
         ):
             self._disable_forecasting("solver-step time_coord did not match the active schedule")
 
@@ -356,6 +332,9 @@ class SpectrumSDXLRuntime:
             }
 
         state = self._ensure_stream_state(stream_key, ctx["run_id"])
+        schedule_coord_bounds = self._schedule_coord_bounds(transformer_options)
+        if schedule_coord_bounds is not None:
+            state.forecaster.set_coord_bounds(*schedule_coord_bounds)
         existing = state.decisions_by_solver_step.get(ctx["solver_step_id"])
         if existing is not None:
             if self._forecast_disabled and not existing.get("finalized", False):
@@ -368,11 +347,7 @@ class SpectrumSDXLRuntime:
         state.local_step_count += 1
 
         actual_forward = ctx["actual_forward"]
-        tail_actual_only = self._is_tail_actual_step(
-            ctx["solver_step_id"],
-            ctx["total_steps"],
-            ctx["time_coord"],
-        )
+        tail_actual_only = self._is_tail_actual_step(ctx["solver_step_id"], ctx["total_steps"])
         if actual_forward is None:
             actual_forward = True
             if (

@@ -10,11 +10,13 @@ import torch
 
 @dataclass
 class _FitCache:
-    """Cached regression fit for the current coordinate history."""
+    """Cached regression fit for the current sigma-coordinate history."""
 
     coeff: torch.Tensor
     feature_shape: torch.Size
     feature_dtype: torch.dtype
+    coord_min: float
+    coord_max: float
 
 
 class ChebyshevFeatureForecaster:
@@ -23,8 +25,8 @@ class ChebyshevFeatureForecaster:
 
     The predictor fits a Chebyshev basis with ridge regularization over
     observed hidden features, then blends that forecast with a local
-    first-order extrapolation. It assumes the provided ``time_coord`` values
-    are already in a common schedule-coordinate space.
+    first-order extrapolation. The provided ``time_coord`` values are raw
+    sigma-space coordinates and are normalized internally for the fit.
     """
 
     def __init__(self, degree: int, ridge_lambda: float, blend_weight: float, history_size: int = 100):
@@ -42,10 +44,21 @@ class ChebyshevFeatureForecaster:
         self._feature_dtype: Optional[torch.dtype] = None
         self._feature_device: Optional[torch.device] = None
         self._fit_cache: Optional[_FitCache] = None
+        self._coord_bounds: Optional[Tuple[float, float]] = None
 
     def ready(self) -> bool:
         """Return whether enough history exists to attempt a forecast."""
         return len(self.history) >= 2
+
+    def set_coord_bounds(self, coord_min: float, coord_max: float) -> None:
+        """Persist the active schedule-wide sigma span for future fits."""
+        lo = float(min(coord_min, coord_max))
+        hi = float(max(coord_min, coord_max))
+        new_bounds = (lo, hi)
+        if self._coord_bounds == new_bounds:
+            return
+        self._coord_bounds = new_bounds
+        self._fit_cache = None
 
     def update(self, time_coord: float, feature: torch.Tensor) -> None:
         """Append an observed feature for one solver-step time coordinate."""
@@ -65,9 +78,13 @@ class ChebyshevFeatureForecaster:
             self.history.pop(0)
         self._fit_cache = None
 
-    def _coords(self, time_values: torch.Tensor) -> torch.Tensor:
-        """Return schedule coordinates in the Chebyshev domain ``[-1, 1]``."""
-        return time_values.to(torch.float32)
+    def _tau(self, time_values: torch.Tensor, coord_min: float, coord_max: float) -> torch.Tensor:
+        """Map raw sigma coordinates to the Chebyshev domain ``[-1, 1]``."""
+        values = time_values.to(torch.float32)
+        denom = float(coord_max) - float(coord_min)
+        if abs(denom) < 1e-12:
+            return torch.zeros_like(values, dtype=torch.float32)
+        return ((values - float(coord_min)) / denom) * 2.0 - 1.0
 
     def _design(self, taus: torch.Tensor, degree: int) -> torch.Tensor:
         """Construct the Chebyshev design matrix up to the requested degree."""
@@ -91,7 +108,12 @@ class ChebyshevFeatureForecaster:
 
         device = self._feature_device
         time_tensor = torch.tensor([t for t, _ in self.history], device=device, dtype=torch.float32)
-        taus = self._coords(time_tensor)
+        if self._coord_bounds is not None:
+            coord_min, coord_max = self._coord_bounds
+        else:
+            coord_min = float(time_tensor.min().item())
+            coord_max = float(time_tensor.max().item())
+        taus = self._tau(time_tensor, coord_min, coord_max)
         x_mat = self._design(taus, self.degree)
         h_mat = torch.stack([feat.reshape(-1).to(torch.float32) for _, feat in self.history], dim=0)
 
@@ -112,13 +134,17 @@ class ChebyshevFeatureForecaster:
             coeff=coeff,
             feature_shape=self._feature_shape,
             feature_dtype=self._feature_dtype,
+            coord_min=coord_min,
+            coord_max=coord_max,
         )
 
     def _predict_chebyshev(self, time_coord: float) -> torch.Tensor:
         """Predict a feature using only the fitted Chebyshev basis."""
         assert self._fit_cache is not None
-        tau_star = self._coords(
+        tau_star = self._tau(
             torch.tensor([float(time_coord)], device=self._fit_cache.coeff.device, dtype=torch.float32),
+            self._fit_cache.coord_min,
+            self._fit_cache.coord_max,
         )
         x_star = self._design(tau_star, self.degree)
         pred = (x_star @ self._fit_cache.coeff).reshape(self._fit_cache.feature_shape)

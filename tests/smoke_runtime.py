@@ -195,11 +195,11 @@ def test_outer_step_controller_same_object_restart_resets_run_state() -> None:
     assert second["spectrum_solver_step_id"] == 1
     assert restarted["spectrum_run_id"] != first["spectrum_run_id"]
     assert restarted["spectrum_solver_step_id"] == 0
-    assert torch.allclose(torch.tensor(restarted["spectrum_time_coord"]), torch.tensor(-1.0), atol=1e-6)
+    assert torch.allclose(torch.tensor(restarted["spectrum_time_coord"]), torch.tensor(1.0), atol=1e-6)
 
 
-def test_outer_step_controller_uses_schedule_time_coord() -> None:
-    """The controller must keep time_coord aligned with the normalized sigma schedule."""
+def test_outer_step_controller_uses_raw_sigma_time_coord() -> None:
+    """The controller must stamp raw sigma values as the forecast coordinate."""
     runtime = SpectrumSDXLRuntime(_make_cfg())
     controller = _SpectrumOuterStepController(
         runtime=runtime,
@@ -217,29 +217,12 @@ def test_outer_step_controller_uses_schedule_time_coord() -> None:
 
     assert first["spectrum_solver_step_id"] == 0
     assert second["spectrum_solver_step_id"] == 1
-    assert torch.allclose(torch.tensor(first["spectrum_time_coord"]), torch.tensor(-1.0), atol=1e-6)
-    assert torch.allclose(torch.tensor(second["spectrum_time_coord"]), torch.tensor(0.12), atol=1e-6)
-
-
-def test_outer_step_controller_preserves_normalized_ordinal_fallback_without_sample_sigmas() -> None:
-    """Without sample_sigmas, fallback coordinates must stay in normalized ordinal space."""
-    runtime = SpectrumSDXLRuntime(_make_cfg())
-    runtime.last_info["num_steps"] = 5
-    model_options = {"transformer_options": {}}
-    controller = _SpectrumOuterStepController(
-        runtime=runtime,
-        delegate=lambda args: args["model_options"]["transformer_options"].copy(),
-    )
-
-    first = controller({"model_options": model_options, "sigma": torch.tensor([1.0])})
-    second = controller({"model_options": model_options, "sigma": torch.tensor([0.5])})
-
-    assert torch.allclose(torch.tensor(first["spectrum_time_coord"]), torch.tensor(-1.0), atol=1e-6)
-    assert torch.allclose(torch.tensor(second["spectrum_time_coord"]), torch.tensor(-0.5), atol=1e-6)
+    assert torch.allclose(torch.tensor(first["spectrum_time_coord"]), torch.tensor(14.0), atol=1e-6)
+    assert torch.allclose(torch.tensor(second["spectrum_time_coord"]), torch.tensor(7.0), atol=1e-6)
 
 
 def test_runtime_disables_forecasting_when_time_coord_does_not_match_schedule() -> None:
-    """A mismatched controller time axis must fail open instead of forecasting."""
+    """A mismatched raw sigma coordinate must fail open instead of forecasting."""
     runtime = SpectrumSDXLRuntime(_make_cfg())
     sample_sigmas = torch.tensor([14.0, 7.0, 1.5, 0.0], dtype=torch.float32)
     decision = runtime.begin_step(
@@ -249,7 +232,7 @@ def test_runtime_disables_forecasting_when_time_coord_does_not_match_schedule() 
             "cond_or_uncond": (1, 0),
             "spectrum_run_id": "run-a",
             "spectrum_solver_step_id": 1,
-            "spectrum_time_coord": 1.0,
+            "spectrum_time_coord": 123.0,
             "spectrum_total_steps": 3,
         },
         torch.tensor([7.0]),
@@ -375,7 +358,7 @@ def test_model_function_wrapper_same_object_restart_resets_run_state() -> None:
     assert second["spectrum_solver_step_id"] == 1
     assert restarted["spectrum_run_id"] != first["spectrum_run_id"]
     assert restarted["spectrum_solver_step_id"] == 0
-    assert torch.allclose(torch.tensor(restarted["spectrum_time_coord"]), torch.tensor(-1.0), atol=1e-6)
+    assert torch.allclose(torch.tensor(restarted["spectrum_time_coord"]), torch.tensor(1.0), atol=1e-6)
 
 
 def test_model_function_wrapper_preserves_existing_context() -> None:
@@ -567,12 +550,12 @@ def test_run_id_switch_resets_stream_state() -> None:
     assert runtime.last_info["run_id"] == "run-b"
 
 
-def test_forecaster_uses_schedule_coordinates_not_ordinal_step_index() -> None:
-    """Direct forecaster predictions should accept the runtime total-steps contract."""
+def test_forecaster_chebyshev_fit_falls_back_to_observed_sigma_range() -> None:
+    """Without an explicit schedule span, the fit must fall back to observed sigma bounds."""
     forecaster = ChebyshevFeatureForecaster(
         degree=2,
         ridge_lambda=0.1,
-        blend_weight=0.0,
+        blend_weight=1.0,
         history_size=10,
     )
     forecaster.update(10.0, torch.tensor([10.0]))
@@ -580,7 +563,59 @@ def test_forecaster_uses_schedule_coordinates_not_ordinal_step_index() -> None:
 
     pred = forecaster.predict(1.0, 11)
 
-    assert torch.allclose(pred, torch.tensor([1.0]), atol=1e-5)
+    assert forecaster._fit_cache is not None
+    assert torch.allclose(torch.tensor(forecaster._fit_cache.coord_min), torch.tensor(9.0), atol=1e-6)
+    assert torch.allclose(torch.tensor(forecaster._fit_cache.coord_max), torch.tensor(10.0), atol=1e-6)
+    assert torch.isfinite(pred).all()
+
+
+def test_runtime_uses_schedule_wide_sigma_bounds_for_forecast_fit() -> None:
+    """When sample_sigmas are available, the fit must use the full active schedule span."""
+    runtime = SpectrumSDXLRuntime(_make_cfg())
+    sample_sigmas = torch.tensor([10.0, 9.0, 1.0, 0.0], dtype=torch.float32)
+
+    for solver_step_id, time_coord, value in ((0, 10.0, 10.0), (1, 9.0, 9.0)):
+        decision = runtime.begin_step(
+            {
+                "sample_sigmas": sample_sigmas,
+                "uuids": ("u0",),
+                "cond_or_uncond": (0,),
+                "spectrum_run_id": "run-a",
+                "spectrum_solver_step_id": solver_step_id,
+                "spectrum_time_coord": time_coord,
+                "spectrum_actual_forward": True,
+                "spectrum_total_steps": 3,
+            },
+            torch.tensor([time_coord]),
+            (1, 1, 1, 1),
+        )
+        runtime.observe_actual_feature(
+            decision["stream_key"],
+            decision["solver_step_id"],
+            torch.full((1, 1, 1, 1), value, dtype=torch.float16),
+        )
+
+    forecast = runtime.begin_step(
+        {
+            "sample_sigmas": sample_sigmas,
+            "uuids": ("u0",),
+            "cond_or_uncond": (0,),
+            "spectrum_run_id": "run-a",
+            "spectrum_solver_step_id": 2,
+            "spectrum_time_coord": 1.0,
+            "spectrum_actual_forward": False,
+            "spectrum_total_steps": 3,
+        },
+        torch.tensor([1.0]),
+        (1, 1, 1, 1),
+    )
+
+    pred = runtime.predict_feature(forecast["stream_key"], forecast["solver_step_id"])
+    state = runtime.stream_states[forecast["stream_key"]]
+    assert state.forecaster._fit_cache is not None
+    assert torch.allclose(torch.tensor(state.forecaster._fit_cache.coord_min), torch.tensor(1.0), atol=1e-6)
+    assert torch.allclose(torch.tensor(state.forecaster._fit_cache.coord_max), torch.tensor(10.0), atol=1e-6)
+    assert torch.isfinite(pred).all()
 
 
 def test_chebyshev_prediction_varies_with_time_coord() -> None:
@@ -606,7 +641,7 @@ def test_tail_actual_steps_force_real_tail_even_with_ready_history() -> None:
     cfg = _make_cfg()
     cfg.tail_actual_steps = 1
     runtime = SpectrumSDXLRuntime(cfg.validated())
-    coords = (-1.0, -0.5, 0.0, 0.5, 1.0)
+    coords = (10.0, 8.0, 6.0, 4.0, 2.0)
 
     first = runtime.begin_step(
         _step_options("run-a", 0, coords[0], True, total_steps=5),
@@ -665,7 +700,7 @@ def test_tail_actual_steps_zero_preserves_existing_scheduler_behavior() -> None:
     cfg = _make_cfg()
     cfg.tail_actual_steps = 0
     runtime = SpectrumSDXLRuntime(cfg.validated())
-    coords = (-1.0, -0.5, 0.0, 0.5, 1.0)
+    coords = (10.0, 8.0, 6.0, 4.0, 2.0)
 
     first = runtime.begin_step(
         _step_options("run-a", 0, coords[0], True, total_steps=5),
@@ -724,7 +759,7 @@ def test_tail_actual_steps_greater_than_total_steps_forces_all_steps_real() -> N
     cfg = _make_cfg()
     cfg.tail_actual_steps = 10
     runtime = SpectrumSDXLRuntime(cfg.validated())
-    coords = (-1.0, -0.5, 0.0, 0.5, 1.0)
+    coords = (10.0, 8.0, 6.0, 4.0, 2.0)
 
     for solver_step_id in range(5):
         step = runtime.begin_step(
@@ -742,31 +777,6 @@ def test_tail_actual_steps_greater_than_total_steps_forces_all_steps_real() -> N
         )
 
 
-def test_tail_actual_threshold_preserves_uniform_step_semantics() -> None:
-    """Schedule-space tail gating must match the old step-count behavior on uniform schedules."""
-    runtime = SpectrumSDXLRuntime(_make_cfg())
-    runtime.cfg.tail_actual_steps = 1
-
-    threshold = runtime._tail_actual_coord_threshold(12)
-    assert threshold is not None
-    assert torch.allclose(torch.tensor(threshold), torch.tensor(0.9090909), atol=1e-6)
-
-    assert runtime._is_tail_actual_step(10, 12, 0.8181818) is False
-    assert runtime._is_tail_actual_step(11, 12, 1.0) is True
-
-
-def test_tail_actual_threshold_expands_real_tail_on_compressed_schedule() -> None:
-    """Compressed schedules must protect more late steps once the gate uses schedule coordinates."""
-    runtime = SpectrumSDXLRuntime(_make_cfg())
-    runtime.cfg.tail_actual_steps = 1
-
-    assert runtime._is_tail_actual_step(7, 12, 0.8628222828) is False
-    assert runtime._is_tail_actual_step(8, 12, 0.9109806943) is True
-    assert runtime._is_tail_actual_step(9, 12, 0.9484118786) is True
-    assert runtime._is_tail_actual_step(10, 12, 0.9784475643) is True
-    assert runtime._is_tail_actual_step(11, 12, 1.0) is True
-
-
 def main() -> None:
     """Run the lightweight regression suite without external test tooling."""
     test_missing_solver_step_context_fails_open()
@@ -776,8 +786,7 @@ def main() -> None:
     test_explicit_solver_step_context_without_decision_still_schedules()
     test_outer_step_controller_injects_context_and_resets_runs()
     test_outer_step_controller_same_object_restart_resets_run_state()
-    test_outer_step_controller_uses_schedule_time_coord()
-    test_outer_step_controller_preserves_normalized_ordinal_fallback_without_sample_sigmas()
+    test_outer_step_controller_uses_raw_sigma_time_coord()
     test_model_function_wrapper_injects_context_for_bypassed_guider_path()
     test_model_function_wrapper_reuses_solver_step_for_repeated_same_sigma_subcalls()
     test_model_function_wrapper_same_object_restart_resets_run_state()
@@ -789,13 +798,12 @@ def main() -> None:
     test_duplicate_actual_updates_are_deduped()
     test_forecast_fallback_commits_actual_bookkeeping()
     test_run_id_switch_resets_stream_state()
-    test_forecaster_uses_schedule_coordinates_not_ordinal_step_index()
+    test_forecaster_chebyshev_fit_falls_back_to_observed_sigma_range()
+    test_runtime_uses_schedule_wide_sigma_bounds_for_forecast_fit()
     test_chebyshev_prediction_varies_with_time_coord()
     test_tail_actual_steps_force_real_tail_even_with_ready_history()
     test_tail_actual_steps_zero_preserves_existing_scheduler_behavior()
     test_tail_actual_steps_greater_than_total_steps_forces_all_steps_real()
-    test_tail_actual_threshold_preserves_uniform_step_semantics()
-    test_tail_actual_threshold_expands_real_tail_on_compressed_schedule()
     print("ok")
 
 
