@@ -20,6 +20,7 @@ _MODEL_FUNCTION_WRAPPER_KEY = "spectrum_sdxl_model_function_wrapper"
 _RUN_ID_KEY = "spectrum_run_id"
 _SOLVER_STEP_ID_KEY = "spectrum_solver_step_id"
 _TIME_COORD_KEY = "spectrum_time_coord"
+_MODEL_TIME_COORD_KEY = "spectrum_model_time_coord"
 _TOTAL_STEPS_KEY = "spectrum_total_steps"
 
 
@@ -226,7 +227,7 @@ class _SpectrumOuterStepController:
                 "[Spectrum SDXL] controller "
                 f"run={transformer_options.get(_RUN_ID_KEY)} "
                 f"step={transformer_options.get(_SOLVER_STEP_ID_KEY)} "
-                f"time={transformer_options.get(_TIME_COORD_KEY)} "
+                f"sigma={transformer_options.get(_TIME_COORD_KEY)} "
                 f"total={transformer_options.get(_TOTAL_STEPS_KEY)} "
                 f"model_options_id={id(model_options)} "
                 f"transformer_options_id={id(transformer_options)}"
@@ -274,7 +275,7 @@ class _SpectrumModelFunctionWrapper:
                 "[Spectrum SDXL] model_wrapper "
                 f"run={transformer_options.get(_RUN_ID_KEY)} "
                 f"step={transformer_options.get(_SOLVER_STEP_ID_KEY)} "
-                f"time={transformer_options.get(_TIME_COORD_KEY)} "
+                f"sigma={transformer_options.get(_TIME_COORD_KEY)} "
                 f"total={transformer_options.get(_TOTAL_STEPS_KEY)} "
                 f"forced_actual={transformer_options.get('spectrum_actual_forward', None)}"
             )
@@ -367,12 +368,22 @@ def _wrap_sdxl_unet_forward(inner: Any) -> None:
         if transformer_options is None:
             transformer_options = {}
 
+        model_time_coord = None
+        if timesteps is not None:
+            try:
+                model_time_coord = float(timesteps.detach().flatten()[0].item())
+            except Exception:
+                model_time_coord = None
+        if model_time_coord is not None:
+            transformer_options[_MODEL_TIME_COORD_KEY] = model_time_coord
+
         if runtime.cfg.debug:
             print(
                 "[Spectrum SDXL] unet "
                 f"run={transformer_options.get(_RUN_ID_KEY)} "
                 f"step={transformer_options.get(_SOLVER_STEP_ID_KEY)} "
-                f"time={transformer_options.get(_TIME_COORD_KEY)} "
+                f"sigma={transformer_options.get(_TIME_COORD_KEY)} "
+                f"model_time={transformer_options.get(_MODEL_TIME_COORD_KEY)} "
                 f"total={transformer_options.get(_TOTAL_STEPS_KEY)} "
                 f"transformer_options_id={id(transformer_options)} "
                 f"stream_key_present="
