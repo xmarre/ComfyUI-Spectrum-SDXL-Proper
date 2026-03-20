@@ -156,6 +156,19 @@ class SpectrumSDXLRuntime:
         idx = min(max(int(solver_step_id), 0), len(values) - 1)
         return float(values[idx])
 
+    def _schedule_coord_bounds(self, transformer_options: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+        """Return the active schedule-wide sigma span when sample sigmas are available."""
+        sample_sigmas = transformer_options.get("sample_sigmas", None)
+        if sample_sigmas is None:
+            return None
+        try:
+            values = tuple(float(v) for v in sample_sigmas.detach().flatten().tolist()[:-1])
+        except Exception:
+            return None
+        if not values:
+            return None
+        return float(min(values)), float(max(values))
+
     def _solver_step_context(self, transformer_options: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
         """Validate and extract an explicit outer-step Spectrum context."""
         run_id = transformer_options.get(_RUN_ID_KEY, None)
@@ -319,6 +332,9 @@ class SpectrumSDXLRuntime:
             }
 
         state = self._ensure_stream_state(stream_key, ctx["run_id"])
+        schedule_coord_bounds = self._schedule_coord_bounds(transformer_options)
+        if schedule_coord_bounds is not None:
+            state.forecaster.set_coord_bounds(*schedule_coord_bounds)
         existing = state.decisions_by_solver_step.get(ctx["solver_step_id"])
         if existing is not None:
             if self._forecast_disabled and not existing.get("finalized", False):

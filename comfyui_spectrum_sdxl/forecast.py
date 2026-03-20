@@ -44,10 +44,21 @@ class ChebyshevFeatureForecaster:
         self._feature_dtype: Optional[torch.dtype] = None
         self._feature_device: Optional[torch.device] = None
         self._fit_cache: Optional[_FitCache] = None
+        self._coord_bounds: Optional[Tuple[float, float]] = None
 
     def ready(self) -> bool:
         """Return whether enough history exists to attempt a forecast."""
         return len(self.history) >= 2
+
+    def set_coord_bounds(self, coord_min: float, coord_max: float) -> None:
+        """Persist the active schedule-wide sigma span for future fits."""
+        lo = float(min(coord_min, coord_max))
+        hi = float(max(coord_min, coord_max))
+        new_bounds = (lo, hi)
+        if self._coord_bounds == new_bounds:
+            return
+        self._coord_bounds = new_bounds
+        self._fit_cache = None
 
     def update(self, time_coord: float, feature: torch.Tensor) -> None:
         """Append an observed feature for one solver-step time coordinate."""
@@ -97,8 +108,11 @@ class ChebyshevFeatureForecaster:
 
         device = self._feature_device
         time_tensor = torch.tensor([t for t, _ in self.history], device=device, dtype=torch.float32)
-        coord_min = float(time_tensor.min().item())
-        coord_max = float(time_tensor.max().item())
+        if self._coord_bounds is not None:
+            coord_min, coord_max = self._coord_bounds
+        else:
+            coord_min = float(time_tensor.min().item())
+            coord_max = float(time_tensor.max().item())
         taus = self._tau(time_tensor, coord_min, coord_max)
         x_mat = self._design(taus, self.degree)
         h_mat = torch.stack([feat.reshape(-1).to(torch.float32) for _, feat in self.history], dim=0)

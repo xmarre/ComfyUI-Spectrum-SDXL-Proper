@@ -550,8 +550,8 @@ def test_run_id_switch_resets_stream_state() -> None:
     assert runtime.last_info["run_id"] == "run-b"
 
 
-def test_forecaster_chebyshev_fit_normalizes_observed_sigma_range() -> None:
-    """The Chebyshev fit must cache the observed raw sigma range for normalization."""
+def test_forecaster_chebyshev_fit_falls_back_to_observed_sigma_range() -> None:
+    """Without an explicit schedule span, the fit must fall back to observed sigma bounds."""
     forecaster = ChebyshevFeatureForecaster(
         degree=2,
         ridge_lambda=0.1,
@@ -566,6 +566,55 @@ def test_forecaster_chebyshev_fit_normalizes_observed_sigma_range() -> None:
     assert forecaster._fit_cache is not None
     assert torch.allclose(torch.tensor(forecaster._fit_cache.coord_min), torch.tensor(9.0), atol=1e-6)
     assert torch.allclose(torch.tensor(forecaster._fit_cache.coord_max), torch.tensor(10.0), atol=1e-6)
+    assert torch.isfinite(pred).all()
+
+
+def test_runtime_uses_schedule_wide_sigma_bounds_for_forecast_fit() -> None:
+    """When sample_sigmas are available, the fit must use the full active schedule span."""
+    runtime = SpectrumSDXLRuntime(_make_cfg())
+    sample_sigmas = torch.tensor([10.0, 9.0, 1.0, 0.0], dtype=torch.float32)
+
+    for solver_step_id, time_coord, value in ((0, 10.0, 10.0), (1, 9.0, 9.0)):
+        decision = runtime.begin_step(
+            {
+                "sample_sigmas": sample_sigmas,
+                "uuids": ("u0",),
+                "cond_or_uncond": (0,),
+                "spectrum_run_id": "run-a",
+                "spectrum_solver_step_id": solver_step_id,
+                "spectrum_time_coord": time_coord,
+                "spectrum_actual_forward": True,
+                "spectrum_total_steps": 3,
+            },
+            torch.tensor([time_coord]),
+            (1, 1, 1, 1),
+        )
+        runtime.observe_actual_feature(
+            decision["stream_key"],
+            decision["solver_step_id"],
+            torch.full((1, 1, 1, 1), value, dtype=torch.float16),
+        )
+
+    forecast = runtime.begin_step(
+        {
+            "sample_sigmas": sample_sigmas,
+            "uuids": ("u0",),
+            "cond_or_uncond": (0,),
+            "spectrum_run_id": "run-a",
+            "spectrum_solver_step_id": 2,
+            "spectrum_time_coord": 1.0,
+            "spectrum_actual_forward": False,
+            "spectrum_total_steps": 3,
+        },
+        torch.tensor([1.0]),
+        (1, 1, 1, 1),
+    )
+
+    pred = runtime.predict_feature(forecast["stream_key"], forecast["solver_step_id"])
+    state = runtime.stream_states[forecast["stream_key"]]
+    assert state.forecaster._fit_cache is not None
+    assert torch.allclose(torch.tensor(state.forecaster._fit_cache.coord_min), torch.tensor(1.0), atol=1e-6)
+    assert torch.allclose(torch.tensor(state.forecaster._fit_cache.coord_max), torch.tensor(10.0), atol=1e-6)
     assert torch.isfinite(pred).all()
 
 
@@ -749,7 +798,8 @@ def main() -> None:
     test_duplicate_actual_updates_are_deduped()
     test_forecast_fallback_commits_actual_bookkeeping()
     test_run_id_switch_resets_stream_state()
-    test_forecaster_chebyshev_fit_normalizes_observed_sigma_range()
+    test_forecaster_chebyshev_fit_falls_back_to_observed_sigma_range()
+    test_runtime_uses_schedule_wide_sigma_bounds_for_forecast_fit()
     test_chebyshev_prediction_varies_with_time_coord()
     test_tail_actual_steps_force_real_tail_even_with_ready_history()
     test_tail_actual_steps_zero_preserves_existing_scheduler_behavior()
