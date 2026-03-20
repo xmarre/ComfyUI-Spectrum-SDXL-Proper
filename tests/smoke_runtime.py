@@ -1219,8 +1219,8 @@ def test_tail_actual_steps_greater_than_total_steps_forces_all_steps_real() -> N
         )
 
 
-def test_sdxl_wrapper_forecasts_pre_final_projection_for_splittable_non_codebook_path() -> None:
-    """The SDXL wrapper must forecast the pre-final-projection target when the head is splittable."""
+def test_sdxl_wrapper_forecasts_final_output_for_non_codebook_path() -> None:
+    """The SDXL wrapper must forecast the returned denoiser output for non-codebook paths."""
     cfg = SpectrumSDXLConfig(
         blend_weight=0.0,
         degree=1,
@@ -1338,9 +1338,9 @@ def test_sdxl_wrapper_forecasts_pre_final_projection_for_splittable_non_codebook
 
         state = next(iter(runtime.stream_states.values()))
         assert len(state.forecaster.history) == 3
-        assert torch.allclose(state.forecaster.history[0][1], torch.full((1, 1, 1, 1), 2.0))
-        assert torch.allclose(state.forecaster.history[1][1], torch.full((1, 1, 1, 1), 3.0))
-        assert torch.allclose(state.forecaster.history[2][1], torch.full((1, 1, 1, 1), 4.0))
+        assert torch.allclose(state.forecaster.history[0][1], torch.full((1, 1, 1, 1), 4.0))
+        assert torch.allclose(state.forecaster.history[1][1], torch.full((1, 1, 1, 1), 6.0))
+        assert torch.allclose(state.forecaster.history[2][1], torch.full((1, 1, 1, 1), 8.0))
     finally:
         for name, module in saved_modules.items():
             if module is None:
@@ -1349,8 +1349,8 @@ def test_sdxl_wrapper_forecasts_pre_final_projection_for_splittable_non_codebook
                 sys.modules[name] = module
 
 
-def test_sdxl_wrapper_falls_back_to_final_output_when_non_codebook_head_is_not_splittable() -> None:
-    """Unsplittable non-codebook heads must preserve the existing final-output target behavior."""
+def test_sdxl_wrapper_forecasts_final_output_for_callable_non_codebook_head() -> None:
+    """Callable non-codebook heads must still forecast the returned denoiser output."""
     cfg = SpectrumSDXLConfig(
         blend_weight=0.0,
         degree=1,
@@ -1505,8 +1505,8 @@ def main() -> None:
     test_tail_actual_steps_force_real_tail_even_with_ready_history()
     test_tail_actual_steps_zero_preserves_existing_scheduler_behavior()
     test_tail_actual_steps_greater_than_total_steps_forces_all_steps_real()
-    test_sdxl_wrapper_forecasts_pre_final_projection_for_splittable_non_codebook_path()
-    test_sdxl_wrapper_falls_back_to_final_output_when_non_codebook_head_is_not_splittable()
+    test_sdxl_wrapper_forecasts_final_output_for_non_codebook_path()
+    test_sdxl_wrapper_forecasts_final_output_for_callable_non_codebook_head()
     print("ok")
 
 
