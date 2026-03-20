@@ -426,7 +426,7 @@ class SpectrumSDXLRuntime:
             )
 
     def observe_actual_feature(self, stream_key: Optional[StreamKey], solver_step_id: Optional[int], feature: torch.Tensor) -> None:
-        """Record a real hidden feature for one explicit solver step once."""
+        """Record the real forecast target tensor for one explicit solver step once."""
         if stream_key is None or solver_step_id is None:
             return
         state = self.stream_states.get(stream_key)
@@ -444,7 +444,7 @@ class SpectrumSDXLRuntime:
         state.observed_solver_steps.add(solver_step_id)
 
     def predict_feature(self, stream_key: StreamKey, solver_step_id: int) -> torch.Tensor:
-        """Predict the hidden feature for a specific stream and solver step."""
+        """Predict the configured forecast target tensor for one stream and solver step."""
         state = self.stream_states.get(stream_key)
         if state is None:
             raise RuntimeError("Spectrum runtime has no state for the requested stream.")

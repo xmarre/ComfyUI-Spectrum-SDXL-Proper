@@ -390,27 +390,28 @@ def _wrap_sdxl_unet_forward(inner: Any) -> None:
         solver_step_id = decision["solver_step_id"]
         actual_forward = decision["actual_forward"]
         stream_key = decision["stream_key"]
-        predicted_h = None
+        predicts_codebook_ids = getattr(inner, "predict_codebook_ids", False)
+        predicted_feature = None
 
         transformer_options["original_shape"] = list(x.shape)
         transformer_options["transformer_index"] = 0
 
         if not actual_forward:
             try:
-                predicted_h = runtime.predict_feature(stream_key, solver_step_id)
+                predicted_feature = runtime.predict_feature(stream_key, solver_step_id)
             except Exception:
-                predicted_h = None
+                predicted_feature = None
 
-            if predicted_h is not None:
-                predicted_h = predicted_h.to(device=x.device, dtype=x.dtype)
-                if not torch.isfinite(predicted_h).all():
-                    predicted_h = None
+            if predicted_feature is not None:
+                predicted_feature = predicted_feature.to(device=x.device, dtype=x.dtype)
+                if not torch.isfinite(predicted_feature).all():
+                    predicted_feature = None
 
-            if predicted_h is not None and not runtime.cfg.debug:
+            if predicted_feature is not None and not runtime.cfg.debug:
                 runtime.finalize_step(stream_key, solver_step_id, used_forecast=True)
-                if getattr(inner, "predict_codebook_ids", False):
-                    return inner.id_predictor(predicted_h)
-                return inner.out(predicted_h)
+                if predicts_codebook_ids:
+                    return inner.id_predictor(predicted_feature)
+                return predicted_feature
 
         transformer_patches = transformer_options.get("patches", {})
         num_video_frames = kwargs.get("num_video_frames", transformer_options.get("num_video_frames", 1))
@@ -500,10 +501,13 @@ def _wrap_sdxl_unet_forward(inner: Any) -> None:
             )
 
         h = h.type(x.dtype)
-        runtime.observe_actual_feature(stream_key, solver_step_id, h)
+        if predicts_codebook_ids:
+            runtime.observe_actual_feature(stream_key, solver_step_id, h)
+        else:
+            actual_out = inner.out(h)
+            runtime.observe_actual_feature(stream_key, solver_step_id, actual_out)
 
-        if predicted_h is not None and runtime.cfg.debug:
-            predicted_h = predicted_h.to(device=h.device, dtype=h.dtype)
+        if predicted_feature is not None and runtime.cfg.debug:
             sigma = None
             if timesteps is not None:
                 try:
@@ -511,32 +515,31 @@ def _wrap_sdxl_unet_forward(inner: Any) -> None:
                 except Exception:
                     sigma = None
 
-            if getattr(inner, "predict_codebook_ids", False):
+            if predicts_codebook_ids:
+                predicted_feature = predicted_feature.to(device=h.device, dtype=h.dtype)
                 print(
                     "[Spectrum SDXL] shadow_compare "
                     f"step={solver_step_id} "
                     f"sigma={sigma} "
-                    f"pre_rel_l2={_rel_l2(predicted_h, h):.6f} "
-                    f"pre_cos={_cosine(predicted_h, h):.6f} "
+                    f"pre_rel_l2={_rel_l2(predicted_feature, h):.6f} "
+                    f"pre_cos={_cosine(predicted_feature, h):.6f} "
                     f"out_compare=skipped_codebook_ids"
                 )
             else:
-                pred_out = inner.out(predicted_h)
-                actual_out = inner.out(h)
+                predicted_feature = predicted_feature.to(device=actual_out.device, dtype=actual_out.dtype)
                 print(
                     "[Spectrum SDXL] shadow_compare "
                     f"step={solver_step_id} "
                     f"sigma={sigma} "
-                    f"pre_rel_l2={_rel_l2(predicted_h, h):.6f} "
-                    f"pre_cos={_cosine(predicted_h, h):.6f} "
-                    f"out_rel_l2={_rel_l2(pred_out, actual_out):.6f} "
-                    f"out_cos={_cosine(pred_out, actual_out):.6f}"
+                    f"target=denoiser_output "
+                    f"out_rel_l2={_rel_l2(predicted_feature, actual_out):.6f} "
+                    f"out_cos={_cosine(predicted_feature, actual_out):.6f}"
                 )
                 return actual_out
 
-        if getattr(inner, "predict_codebook_ids", False):
+        if predicts_codebook_ids:
             return inner.id_predictor(h)
-        return inner.out(h)
+        return actual_out
 
     inner._spectrum_sdxl_original_forward = original_forward
     inner._forward = wrapped_forward
