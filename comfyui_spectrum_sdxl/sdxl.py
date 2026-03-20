@@ -85,8 +85,19 @@ class _SpectrumOuterStepController:
         self._active_step_marker = None
         self._active_solver_step_id = 0
 
-    def _extract_time_coord(self, transformer_options: Dict[str, Any], solver_step_id: int) -> float:
-        """Map the current solver step onto the active forecast coordinate."""
+    def _time_coord_from_sigma(self, sigma) -> Optional[float]:
+        """Return the raw sigma value used by the current denoiser call."""
+        try:
+            return float(sigma.detach().flatten()[0].item())
+        except Exception:
+            return None
+
+    def _extract_time_coord(self, transformer_options: Dict[str, Any], solver_step_id: int, sigma) -> float:
+        """Return the raw sigma forecast coordinate for this solver step."""
+        current_sigma = self._time_coord_from_sigma(sigma)
+        if current_sigma is not None:
+            return current_sigma
+
         sample_sigmas = transformer_options.get("sample_sigmas", None)
         if sample_sigmas is not None:
             try:
@@ -95,16 +106,9 @@ class _SpectrumOuterStepController:
                 values = ()
             if values:
                 idx = min(max(int(solver_step_id), 0), len(values) - 1)
-                start = values[0]
-                end = values[-1]
-                denom = end - start
-                if abs(denom) < 1e-12:
-                    return 0.0
-                return float(((values[idx] - start) / denom) * 2.0 - 1.0)
+                return float(values[idx])
 
-        total_steps = self._extract_total_steps(transformer_options)
-        denom = max(int(total_steps) - 1, 1)
-        return float((float(solver_step_id) / float(denom)) * 2.0 - 1.0)
+        return float(solver_step_id)
 
     def _sample_sigmas_token(self, transformer_options: Dict[str, Any]):
         sample_sigmas = transformer_options.get("sample_sigmas", None)
@@ -196,7 +200,11 @@ class _SpectrumOuterStepController:
 
         transformer_options[_RUN_ID_KEY] = self._run_serial
         transformer_options[_SOLVER_STEP_ID_KEY] = solver_step_id
-        transformer_options[_TIME_COORD_KEY] = self._extract_time_coord(transformer_options, solver_step_id)
+        transformer_options[_TIME_COORD_KEY] = self._extract_time_coord(
+            transformer_options,
+            solver_step_id,
+            sigma,
+        )
         transformer_options[_TOTAL_STEPS_KEY] = self._extract_total_steps(transformer_options)
 
     def _ensure_outer_step_context(self, args: Dict[str, Any]) -> None:
