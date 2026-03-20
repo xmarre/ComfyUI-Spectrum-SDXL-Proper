@@ -34,6 +34,8 @@ class _StreamState:
     decisions_by_solver_step: Dict[int, Dict[str, Any]] = field(default_factory=dict)
     observed_solver_steps: Set[int] = field(default_factory=set)
     local_step_count: int = 0
+    recent_validation_rel_l2_override: Optional[float] = None
+    recent_validation_solver_step: Optional[int] = None
 
 
 class SpectrumSDXLRuntime:
@@ -390,7 +392,11 @@ class SpectrumSDXLRuntime:
 
         actual_forward = ctx["actual_forward"]
         tail_actual_only = self._is_tail_actual_step(ctx["solver_step_id"], ctx["total_steps"])
-        recent_validation_rel_l2 = state.forecaster.recent_validation_rel_l2()
+        recent_validation_rel_l2 = None
+        if state.forecaster.ready():
+            recent_validation_rel_l2 = state.recent_validation_rel_l2_override
+            if recent_validation_rel_l2 is None:
+                recent_validation_rel_l2 = state.forecaster.recent_validation_rel_l2()
         if actual_forward is None:
             actual_forward = True
             if (
@@ -491,9 +497,41 @@ class SpectrumSDXLRuntime:
         if decision is None:
             return
 
+        if state.recent_validation_solver_step != int(solver_step_id):
+            state.recent_validation_rel_l2_override = None
+            state.recent_validation_solver_step = None
+
         state.forecaster.update(float(decision["time_coord"]), feature)
         self.finalize_step(stream_key, solver_step_id, used_forecast=False)
         state.observed_solver_steps.add(solver_step_id)
+
+    def observe_validation_rel_l2(
+        self,
+        stream_key: Optional[StreamKey],
+        solver_step_id: Optional[int],
+        rel_l2: Optional[float],
+    ) -> None:
+        """Record the latest holdout validation error when the wrapper has a better proxy."""
+        if stream_key is None or solver_step_id is None or rel_l2 is None:
+            return
+
+        state = self.stream_states.get(stream_key)
+        if state is None:
+            return
+
+        try:
+            solver_step_id = int(solver_step_id)
+            rel_l2 = float(rel_l2)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(rel_l2):
+            rel_l2 = float("inf")
+
+        if state.recent_validation_solver_step is not None and solver_step_id <= state.recent_validation_solver_step:
+            return
+
+        state.recent_validation_rel_l2_override = rel_l2
+        state.recent_validation_solver_step = solver_step_id
 
     def predict_feature(self, stream_key: StreamKey, solver_step_id: int) -> torch.Tensor:
         """Predict the configured forecast target tensor for one stream and solver step."""
