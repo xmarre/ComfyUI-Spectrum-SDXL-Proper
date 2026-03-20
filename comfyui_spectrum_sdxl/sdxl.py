@@ -334,6 +334,22 @@ def _wrap_sdxl_unet_forward(inner: Any) -> None:
 
     original_forward = inner._forward
 
+    def _rel_l2(pred: torch.Tensor, actual: torch.Tensor) -> float:
+        pred_f = pred.detach().to(torch.float32)
+        actual_f = actual.detach().to(torch.float32)
+        denom = float(actual_f.norm().item())
+        if denom < 1e-12:
+            return float("inf")
+        return float((pred_f - actual_f).norm().item() / denom)
+
+    def _cosine(pred: torch.Tensor, actual: torch.Tensor) -> float:
+        pred_f = pred.detach().reshape(-1).to(torch.float32)
+        actual_f = actual.detach().reshape(-1).to(torch.float32)
+        denom = float(pred_f.norm().item() * actual_f.norm().item())
+        if denom < 1e-12:
+            return 0.0
+        return float(torch.dot(pred_f, actual_f).item() / denom)
+
     def wrapped_forward(
         x,
         timesteps=None,
@@ -374,6 +390,7 @@ def _wrap_sdxl_unet_forward(inner: Any) -> None:
         solver_step_id = decision["solver_step_id"]
         actual_forward = decision["actual_forward"]
         stream_key = decision["stream_key"]
+        predicted_h = None
 
         transformer_options["original_shape"] = list(x.shape)
         transformer_options["transformer_index"] = 0
@@ -389,7 +406,7 @@ def _wrap_sdxl_unet_forward(inner: Any) -> None:
                 if not torch.isfinite(predicted_h).all():
                     predicted_h = None
 
-            if predicted_h is not None:
+            if predicted_h is not None and not runtime.cfg.debug:
                 runtime.finalize_step(stream_key, solver_step_id, used_forecast=True)
                 if getattr(inner, "predict_codebook_ids", False):
                     return inner.id_predictor(predicted_h)
@@ -484,6 +501,38 @@ def _wrap_sdxl_unet_forward(inner: Any) -> None:
 
         h = h.type(x.dtype)
         runtime.observe_actual_feature(stream_key, solver_step_id, h)
+
+        if predicted_h is not None and runtime.cfg.debug:
+            predicted_h = predicted_h.to(device=h.device, dtype=h.dtype)
+            sigma = None
+            if timesteps is not None:
+                try:
+                    sigma = float(timesteps.detach().flatten()[0].item())
+                except Exception:
+                    sigma = None
+
+            if getattr(inner, "predict_codebook_ids", False):
+                print(
+                    "[Spectrum SDXL] shadow_compare "
+                    f"step={solver_step_id} "
+                    f"sigma={sigma} "
+                    f"pre_rel_l2={_rel_l2(predicted_h, h):.6f} "
+                    f"pre_cos={_cosine(predicted_h, h):.6f} "
+                    f"out_compare=skipped_codebook_ids"
+                )
+            else:
+                pred_out = inner.out(predicted_h)
+                actual_out = inner.out(h)
+                print(
+                    "[Spectrum SDXL] shadow_compare "
+                    f"step={solver_step_id} "
+                    f"sigma={sigma} "
+                    f"pre_rel_l2={_rel_l2(predicted_h, h):.6f} "
+                    f"pre_cos={_cosine(predicted_h, h):.6f} "
+                    f"out_rel_l2={_rel_l2(pred_out, actual_out):.6f} "
+                    f"out_cos={_cosine(pred_out, actual_out):.6f}"
+                )
+                return actual_out
 
         if getattr(inner, "predict_codebook_ids", False):
             return inner.id_predictor(h)
