@@ -1016,8 +1016,138 @@ def test_tail_actual_steps_greater_than_total_steps_forces_all_steps_real() -> N
         )
 
 
-def test_sdxl_wrapper_forecasts_final_output_for_non_codebook_path() -> None:
-    """The SDXL wrapper must forecast the denoiser output, not pre-head hidden state."""
+def test_sdxl_wrapper_forecasts_pre_final_projection_for_splittable_non_codebook_path() -> None:
+    """The SDXL wrapper must forecast the pre-final-projection target when the head is splittable."""
+    cfg = SpectrumSDXLConfig(
+        blend_weight=0.0,
+        degree=1,
+        ridge_lambda=0.0,
+        window_size=2.0,
+        flex_window=0.75,
+        warmup_steps=0,
+        tail_actual_steps=0,
+        min_fit_points=3,
+    ).validated()
+    runtime = SpectrumSDXLRuntime(cfg)
+
+    module_names = (
+        "comfy",
+        "comfy.ldm",
+        "comfy.ldm.modules",
+        "comfy.ldm.modules.diffusionmodules",
+        "comfy.ldm.modules.diffusionmodules.openaimodel",
+    )
+    saved_modules = {name: sys.modules.get(name) for name in module_names}
+
+    try:
+        comfy = types.ModuleType("comfy")
+        ldm = types.ModuleType("comfy.ldm")
+        modules = types.ModuleType("comfy.ldm.modules")
+        diffusionmodules = types.ModuleType("comfy.ldm.modules.diffusionmodules")
+        openaimodel = types.ModuleType("comfy.ldm.modules.diffusionmodules.openaimodel")
+
+        def apply_control(h, control, where):
+            del control, where
+            return h
+
+        def forward_timestep_embed(module, h, emb, context, transformer_options, output_shape=None, **kwargs):
+            del emb, context, transformer_options, output_shape, kwargs
+            return module(h) if callable(module) else h
+
+        def timestep_embedding(timesteps, channels, repeat_only=False):
+            del repeat_only
+            return timesteps.reshape(-1, 1).to(torch.float32).repeat(1, channels)
+
+        openaimodel.apply_control = apply_control
+        openaimodel.forward_timestep_embed = forward_timestep_embed
+        openaimodel.timestep_embedding = timestep_embedding
+        diffusionmodules.openaimodel = openaimodel
+        modules.diffusionmodules = diffusionmodules
+        ldm.modules = modules
+        comfy.ldm = ldm
+
+        sys.modules["comfy"] = comfy
+        sys.modules["comfy.ldm"] = ldm
+        sys.modules["comfy.ldm.modules"] = modules
+        sys.modules["comfy.ldm.modules.diffusionmodules"] = diffusionmodules
+        sys.modules["comfy.ldm.modules.diffusionmodules.openaimodel"] = openaimodel
+
+        class _AddOne(torch.nn.Module):
+            def forward(self, x):
+                return x + 1.0
+
+        class _TimesTwo(torch.nn.Module):
+            def forward(self, x):
+                return x * 2.0
+
+        class _FakeInner:
+            def __init__(self):
+                self.input_blocks = []
+                self.output_blocks = []
+                self.middle_block = None
+                self.time_embed = lambda emb: emb
+                self.out = torch.nn.Sequential(_AddOne(), _TimesTwo())
+                self.model_channels = 1
+                self.num_classes = None
+                self.predict_codebook_ids = False
+                self._forward = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("unwrapped forward used"))
+
+        inner = _FakeInner()
+        _wrap_sdxl_unet_forward(inner)
+
+        def _options(step_id: int, time_coord: float, actual_forward: bool) -> dict:
+            return {
+                _RUNTIME_KEY: runtime,
+                "spectrum_run_id": "run-a",
+                "spectrum_solver_step_id": step_id,
+                "spectrum_time_coord": time_coord,
+                "spectrum_total_steps": 4,
+                "spectrum_actual_forward": actual_forward,
+                "uuids": ["stream-a"],
+                "cond_or_uncond": [0],
+            }
+
+        first = inner._forward(
+            torch.full((1, 1, 1, 1), 1.0),
+            timesteps=torch.tensor([0.0]),
+            transformer_options=_options(0, 0.0, True),
+        )
+        second = inner._forward(
+            torch.full((1, 1, 1, 1), 2.0),
+            timesteps=torch.tensor([1.0]),
+            transformer_options=_options(1, 1.0, True),
+        )
+        third = inner._forward(
+            torch.full((1, 1, 1, 1), 3.0),
+            timesteps=torch.tensor([2.0]),
+            transformer_options=_options(2, 2.0, True),
+        )
+        forecast = inner._forward(
+            torch.full((1, 1, 1, 1), 999.0),
+            timesteps=torch.tensor([3.0]),
+            transformer_options=_options(3, 3.0, False),
+        )
+
+        assert torch.allclose(first, torch.full((1, 1, 1, 1), 4.0))
+        assert torch.allclose(second, torch.full((1, 1, 1, 1), 6.0))
+        assert torch.allclose(third, torch.full((1, 1, 1, 1), 8.0))
+        assert torch.allclose(forecast, torch.full((1, 1, 1, 1), 10.0), atol=1e-5)
+
+        state = next(iter(runtime.stream_states.values()))
+        assert len(state.forecaster.history) == 3
+        assert torch.allclose(state.forecaster.history[0][1], torch.full((1, 1, 1, 1), 2.0))
+        assert torch.allclose(state.forecaster.history[1][1], torch.full((1, 1, 1, 1), 3.0))
+        assert torch.allclose(state.forecaster.history[2][1], torch.full((1, 1, 1, 1), 4.0))
+    finally:
+        for name, module in saved_modules.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+
+def test_sdxl_wrapper_falls_back_to_final_output_when_non_codebook_head_is_not_splittable() -> None:
+    """Unsplittable non-codebook heads must preserve the existing final-output target behavior."""
     cfg = SpectrumSDXLConfig(
         blend_weight=0.0,
         degree=1,
@@ -1093,7 +1223,7 @@ def test_sdxl_wrapper_forecasts_final_output_for_non_codebook_path() -> None:
                 "spectrum_run_id": "run-a",
                 "spectrum_solver_step_id": step_id,
                 "spectrum_time_coord": time_coord,
-                "spectrum_total_steps": 3,
+                "spectrum_total_steps": 4,
                 "spectrum_actual_forward": actual_forward,
                 "uuids": ["stream-a"],
                 "cond_or_uncond": [0],
@@ -1168,7 +1298,8 @@ def main() -> None:
     test_tail_actual_steps_force_real_tail_even_with_ready_history()
     test_tail_actual_steps_zero_preserves_existing_scheduler_behavior()
     test_tail_actual_steps_greater_than_total_steps_forces_all_steps_real()
-    test_sdxl_wrapper_forecasts_final_output_for_non_codebook_path()
+    test_sdxl_wrapper_forecasts_pre_final_projection_for_splittable_non_codebook_path()
+    test_sdxl_wrapper_falls_back_to_final_output_when_non_codebook_head_is_not_splittable()
     print("ok")
 
 
