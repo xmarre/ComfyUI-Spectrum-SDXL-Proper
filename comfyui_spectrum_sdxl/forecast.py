@@ -21,10 +21,10 @@ class _FitCache:
 
 class ChebyshevFeatureForecaster:
     """
-    Forecast the final hidden SDXL U-Net feature.
+    Forecast the configured SDXL target tensor.
 
     The predictor fits a Chebyshev basis with ridge regularization over
-    observed hidden features, then blends that forecast with a local
+    observed target tensors, then blends that forecast with a local
     first-order extrapolation. The provided ``time_coord`` values are raw
     sigma-space coordinates and are normalized internally for the fit.
     """
@@ -168,7 +168,7 @@ class ChebyshevFeatureForecaster:
         return last_feat + k * (last_feat - prev_feat)
 
     def predict(self, time_coord: float, total_steps: int) -> torch.Tensor:
-        """Predict the hidden feature for a future solver-step coordinate."""
+        """Predict the configured target tensor for a future solver-step coordinate."""
         del total_steps
         if not self.history:
             raise RuntimeError("Spectrum forecaster was asked to predict without history.")
