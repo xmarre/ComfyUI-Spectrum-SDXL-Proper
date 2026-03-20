@@ -19,6 +19,16 @@ class _FitCache:
     coord_max: float
 
 
+@dataclass
+class _ValidationCache:
+    """Cached recent one-step validation result for the current fit state."""
+
+    history_len: int
+    coord_min: float
+    coord_max: float
+    rel_l2: float
+
+
 class ChebyshevFeatureForecaster:
     """
     Forecast the configured SDXL target tensor.
@@ -29,12 +39,20 @@ class ChebyshevFeatureForecaster:
     sigma-space coordinates and are normalized internally for the fit.
     """
 
-    def __init__(self, degree: int, ridge_lambda: float, blend_weight: float, history_size: int = 100):
+    def __init__(
+        self,
+        degree: int,
+        ridge_lambda: float,
+        blend_weight: float,
+        history_size: int = 100,
+        min_fit_points: int = 6,
+    ):
         """Initialize the online forecaster."""
         self.degree = int(degree)
         self.ridge_lambda = float(ridge_lambda)
         self.blend_weight = float(blend_weight)
         self.history_size = int(history_size)
+        self.min_fit_points = int(min_fit_points)
         self.reset()
 
     def reset(self) -> None:
@@ -44,11 +62,12 @@ class ChebyshevFeatureForecaster:
         self._feature_dtype: Optional[torch.dtype] = None
         self._feature_device: Optional[torch.device] = None
         self._fit_cache: Optional[_FitCache] = None
+        self._validation_cache: Optional[_ValidationCache] = None
         self._coord_bounds: Optional[Tuple[float, float]] = None
 
     def ready(self) -> bool:
         """Return whether enough history exists to attempt a forecast."""
-        return len(self.history) >= 2
+        return len(self.history) >= max(3, self.degree + 1, self.min_fit_points)
 
     def set_coord_bounds(self, coord_min: float, coord_max: float) -> None:
         """Persist the active schedule-wide sigma span for future fits."""
@@ -59,6 +78,7 @@ class ChebyshevFeatureForecaster:
             return
         self._coord_bounds = new_bounds
         self._fit_cache = None
+        self._validation_cache = None
 
     def update(self, time_coord: float, feature: torch.Tensor) -> None:
         """Append an observed feature for one solver-step time coordinate."""
@@ -77,6 +97,52 @@ class ChebyshevFeatureForecaster:
         if len(self.history) > self.history_size:
             self.history.pop(0)
         self._fit_cache = None
+        self._validation_cache = None
+
+    def _active_coord_bounds(
+        self,
+        history: Optional[List[Tuple[float, torch.Tensor]]] = None,
+    ) -> Tuple[float, float]:
+        """Return the currently active coordinate bounds for fitting."""
+        if self._coord_bounds is not None:
+            return self._coord_bounds
+
+        src = self.history if history is None else history
+        if not src:
+            raise RuntimeError("Spectrum forecaster was asked for bounds without history.")
+        values = [float(t) for t, _ in src]
+        return float(min(values)), float(max(values))
+
+    def _fit_coeff_from_history(
+        self,
+        history: List[Tuple[float, torch.Tensor]],
+        coord_min: float,
+        coord_max: float,
+    ) -> Tuple[torch.Tensor, torch.Size, torch.dtype]:
+        """Fit ridge-regression coefficients from an explicit history slice."""
+        if not history:
+            raise RuntimeError("Spectrum forecaster was asked to fit without history.")
+
+        feature_device = history[-1][1].device
+        time_tensor = torch.tensor([t for t, _ in history], device=feature_device, dtype=torch.float32)
+        taus = self._tau(time_tensor, coord_min, coord_max)
+        x_mat = self._design(taus, self.degree)
+        h_mat = torch.stack([feat.reshape(-1).to(torch.float32) for _, feat in history], dim=0)
+
+        p = x_mat.shape[1]
+        reg = self.ridge_lambda * torch.eye(p, device=feature_device, dtype=torch.float32)
+        lhs = x_mat.transpose(0, 1) @ x_mat + reg
+        rhs = x_mat.transpose(0, 1) @ h_mat
+
+        try:
+            chol = torch.linalg.cholesky(lhs)
+        except RuntimeError:
+            jitter = float(lhs.diag().mean().item()) if lhs.numel() > 0 else 1.0
+            jitter = max(jitter * 1e-6, 1e-6)
+            chol = torch.linalg.cholesky(lhs + jitter * torch.eye(p, device=feature_device, dtype=torch.float32))
+
+        coeff = torch.cholesky_solve(rhs, chol)
+        return coeff, history[-1][1].shape, history[-1][1].dtype
 
     def _tau(self, time_values: torch.Tensor, coord_min: float, coord_max: float) -> torch.Tensor:
         """Map raw sigma coordinates to the Chebyshev domain ``[-1, 1]``."""
@@ -104,36 +170,12 @@ class ChebyshevFeatureForecaster:
             raise RuntimeError("Spectrum forecaster was asked to fit without history.")
         assert self._feature_shape is not None
         assert self._feature_dtype is not None
-        assert self._feature_device is not None
-
-        device = self._feature_device
-        time_tensor = torch.tensor([t for t, _ in self.history], device=device, dtype=torch.float32)
-        if self._coord_bounds is not None:
-            coord_min, coord_max = self._coord_bounds
-        else:
-            coord_min = float(time_tensor.min().item())
-            coord_max = float(time_tensor.max().item())
-        taus = self._tau(time_tensor, coord_min, coord_max)
-        x_mat = self._design(taus, self.degree)
-        h_mat = torch.stack([feat.reshape(-1).to(torch.float32) for _, feat in self.history], dim=0)
-
-        p = x_mat.shape[1]
-        reg = self.ridge_lambda * torch.eye(p, device=device, dtype=torch.float32)
-        lhs = x_mat.transpose(0, 1) @ x_mat + reg
-        rhs = x_mat.transpose(0, 1) @ h_mat
-
-        try:
-            chol = torch.linalg.cholesky(lhs)
-        except RuntimeError:
-            jitter = float(lhs.diag().mean().item()) if lhs.numel() > 0 else 1.0
-            jitter = max(jitter * 1e-6, 1e-6)
-            chol = torch.linalg.cholesky(lhs + jitter * torch.eye(p, device=device, dtype=torch.float32))
-
-        coeff = torch.cholesky_solve(rhs, chol)
+        coord_min, coord_max = self._active_coord_bounds()
+        coeff, feature_shape, feature_dtype = self._fit_coeff_from_history(self.history, coord_min, coord_max)
         self._fit_cache = _FitCache(
             coeff=coeff,
-            feature_shape=self._feature_shape,
-            feature_dtype=self._feature_dtype,
+            feature_shape=feature_shape,
+            feature_dtype=feature_dtype,
             coord_min=coord_min,
             coord_max=coord_max,
         )
@@ -184,3 +226,61 @@ class ChebyshevFeatureForecaster:
         if not torch.isfinite(out).all():
             return latest
         return out.to(dtype=latest.dtype, device=latest.device)
+
+    def recent_validation_rel_l2(self) -> Optional[float]:
+        """
+        Return a cached one-step holdout validation error for the most recent actual point.
+
+        The forecaster is fit on all but the latest actual observation and asked to
+        predict that latest observation in the active coordinate space.
+        """
+        if not self.ready():
+            return None
+
+        coord_min, coord_max = self._active_coord_bounds()
+        if (
+            self._validation_cache is not None
+            and self._validation_cache.history_len == len(self.history)
+            and self._validation_cache.coord_min == coord_min
+            and self._validation_cache.coord_max == coord_max
+        ):
+            return self._validation_cache.rel_l2
+
+        train = self.history[:-1]
+        target_time, target_feat = self.history[-1]
+        if len(train) < 2:
+            return None
+
+        coeff, feature_shape, feature_dtype = self._fit_coeff_from_history(train, coord_min, coord_max)
+        tau_star = self._tau(
+            torch.tensor([float(target_time)], device=coeff.device, dtype=torch.float32),
+            coord_min,
+            coord_max,
+        )
+        x_star = self._design(tau_star, self.degree)
+        cheb = (x_star @ coeff).reshape(feature_shape).to(dtype=feature_dtype)
+
+        prev_time, prev_feat = train[-2]
+        last_time, last_feat = train[-1]
+        dt = float(last_time - prev_time)
+        if abs(dt) < 1e-6:
+            lin = last_feat.to(torch.float32)
+        else:
+            k = (float(target_time) - float(last_time)) / dt
+            lin = last_feat.to(torch.float32) + k * (last_feat.to(torch.float32) - prev_feat.to(torch.float32))
+
+        pred = (1.0 - self.blend_weight) * lin + self.blend_weight * cheb.to(torch.float32)
+        actual = target_feat.detach().to(torch.float32)
+        if not torch.isfinite(pred).all():
+            rel_l2 = float("inf")
+        else:
+            denom = float(actual.norm().item())
+            rel_l2 = float("inf") if denom < 1e-12 else float((pred - actual).norm().item() / denom)
+
+        self._validation_cache = _ValidationCache(
+            history_len=len(self.history),
+            coord_min=coord_min,
+            coord_max=coord_max,
+            rel_l2=rel_l2,
+        )
+        return rel_l2

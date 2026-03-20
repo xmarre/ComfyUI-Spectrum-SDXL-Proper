@@ -27,7 +27,22 @@ def _make_cfg() -> SpectrumSDXLConfig:
         ridge_lambda=0.1,
         window_size=2.0,
         flex_window=0.75,
-        warmup_steps=2,
+        warmup_steps=5,
+        min_fit_points=6,
+    ).validated()
+
+
+def _make_relaxed_cfg() -> SpectrumSDXLConfig:
+    """Create a permissive configuration for tests that need forecastability."""
+    return SpectrumSDXLConfig(
+        blend_weight=0.5,
+        degree=1,
+        ridge_lambda=0.1,
+        window_size=2.0,
+        flex_window=0.75,
+        warmup_steps=0,
+        tail_actual_steps=0,
+        min_fit_points=3,
     ).validated()
 
 
@@ -111,7 +126,7 @@ def test_missing_stream_identity_fails_open() -> None:
 
 def test_explicit_solver_step_context_allows_forecast() -> None:
     """Forecasting should work once the outer solver step is explicit."""
-    runtime = SpectrumSDXLRuntime(_make_cfg())
+    runtime = SpectrumSDXLRuntime(_make_relaxed_cfg())
 
     first = runtime.begin_step(_step_options("run-a", 0, 0.0, True), torch.tensor([0.0]), (2, 8, 4, 4))
     runtime.observe_actual_feature(
@@ -127,7 +142,14 @@ def test_explicit_solver_step_context_allows_forecast() -> None:
         torch.full((2, 8, 4, 4), 2.0, dtype=torch.float16),
     )
 
-    forecast = runtime.begin_step(_step_options("run-a", 2, 2.0, False), torch.tensor([2.0]), (2, 8, 4, 4))
+    third = runtime.begin_step(_step_options("run-a", 2, 2.0, True), torch.tensor([2.0]), (2, 8, 4, 4))
+    runtime.observe_actual_feature(
+        third["stream_key"],
+        third["solver_step_id"],
+        torch.full((2, 8, 4, 4), 3.0, dtype=torch.float16),
+    )
+
+    forecast = runtime.begin_step(_step_options("run-a", 3, 3.0, False), torch.tensor([3.0]), (2, 8, 4, 4))
     assert forecast["actual_forward"] is False
     assert forecast["forecast_safe"] is True
 
@@ -141,7 +163,7 @@ def test_explicit_solver_step_context_allows_forecast() -> None:
 
 def test_runtime_prefers_model_time_coord_for_forecasting() -> None:
     """The forecast axis should follow model-time while sigma still validates the schedule."""
-    runtime = SpectrumSDXLRuntime(_make_cfg())
+    runtime = SpectrumSDXLRuntime(_make_relaxed_cfg())
     sample_sigmas = torch.tensor([14.0, 7.0, 3.0, 1.5, 0.75, 0.25, 0.0], dtype=torch.float32)
 
     first = runtime.begin_step(
@@ -150,7 +172,7 @@ def test_runtime_prefers_model_time_coord_for_forecasting() -> None:
             0,
             14.0,
             True,
-            total_steps=6,
+            total_steps=8,
             model_time_coord=100.0,
             sample_sigmas=sample_sigmas,
         ),
@@ -169,7 +191,7 @@ def test_runtime_prefers_model_time_coord_for_forecasting() -> None:
             1,
             7.0,
             True,
-            total_steps=6,
+            total_steps=8,
             model_time_coord=200.0,
             sample_sigmas=sample_sigmas,
         ),
@@ -182,22 +204,41 @@ def test_runtime_prefers_model_time_coord_for_forecasting() -> None:
         torch.full((2, 8, 4, 4), 2.0, dtype=torch.float16),
     )
 
-    forecast = runtime.begin_step(
+    third = runtime.begin_step(
         _step_options(
             "run-a",
             2,
             3.0,
-            False,
-            total_steps=6,
+            True,
+            total_steps=8,
             model_time_coord=300.0,
             sample_sigmas=sample_sigmas,
         ),
         torch.tensor([300.0]),
         (2, 8, 4, 4),
     )
+    runtime.observe_actual_feature(
+        third["stream_key"],
+        third["solver_step_id"],
+        torch.full((2, 8, 4, 4), 3.0, dtype=torch.float16),
+    )
 
-    assert forecast["time_coord"] == 300.0
-    assert forecast["sigma_coord"] == 3.0
+    forecast = runtime.begin_step(
+        _step_options(
+            "run-a",
+            3,
+            1.5,
+            False,
+            total_steps=8,
+            model_time_coord=400.0,
+            sample_sigmas=sample_sigmas,
+        ),
+        torch.tensor([400.0]),
+        (2, 8, 4, 4),
+    )
+
+    assert forecast["time_coord"] == 400.0
+    assert forecast["sigma_coord"] == 1.5
     assert forecast["actual_forward"] is False
     assert forecast["forecast_safe"] is True
 
@@ -209,12 +250,12 @@ def test_runtime_prefers_model_time_coord_for_forecasting() -> None:
     fit_cache = state.forecaster._fit_cache
     assert fit_cache is not None
     assert torch.allclose(torch.tensor(fit_cache.coord_min), torch.tensor(100.0), atol=1e-6)
-    assert torch.allclose(torch.tensor(fit_cache.coord_max), torch.tensor(300.0), atol=1e-6)
+    assert torch.allclose(torch.tensor(fit_cache.coord_max), torch.tensor(400.0), atol=1e-6)
 
 
 def test_explicit_solver_step_context_without_decision_still_schedules() -> None:
     """Outer-step context alone should be enough once the controller owns step ids."""
-    runtime = SpectrumSDXLRuntime(_make_cfg())
+    runtime = SpectrumSDXLRuntime(_make_relaxed_cfg())
 
     first = runtime.begin_step(_step_options("run-a", 0, 0.0), torch.tensor([0.0]), (2, 8, 4, 4))
     assert first["actual_forward"] is True
@@ -233,8 +274,16 @@ def test_explicit_solver_step_context_without_decision_still_schedules() -> None
     )
 
     third = runtime.begin_step(_step_options("run-a", 2, 2.0), torch.tensor([2.0]), (2, 8, 4, 4))
-    assert third["actual_forward"] is False
-    assert third["forecast_safe"] is True
+    assert third["actual_forward"] is True
+    runtime.observe_actual_feature(
+        third["stream_key"],
+        third["solver_step_id"],
+        torch.full((2, 8, 4, 4), 3.0, dtype=torch.float16),
+    )
+
+    fourth = runtime.begin_step(_step_options("run-a", 3, 3.0), torch.tensor([3.0]), (2, 8, 4, 4))
+    assert fourth["actual_forward"] is False
+    assert fourth["forecast_safe"] is True
 
 
 def test_outer_step_controller_injects_context_and_resets_runs() -> None:
@@ -589,9 +638,9 @@ def test_duplicate_actual_updates_are_deduped() -> None:
 
 def test_forecast_fallback_commits_actual_bookkeeping() -> None:
     """A rejected forecast should not count as a cached pass."""
-    runtime = SpectrumSDXLRuntime(_make_cfg())
+    runtime = SpectrumSDXLRuntime(_make_relaxed_cfg())
 
-    for step_id, value in ((0, 1.0), (1, 2.0)):
+    for step_id, value in ((0, 1.0), (1, 2.0), (2, 3.0)):
         decision = runtime.begin_step(
             _step_options("run-a", step_id, float(step_id), True),
             torch.tensor([float(step_id)]),
@@ -603,14 +652,14 @@ def test_forecast_fallback_commits_actual_bookkeeping() -> None:
             torch.full((2, 8, 4, 4), value, dtype=torch.float16),
         )
 
-    forecast = runtime.begin_step(_step_options("run-a", 2, 2.0, False), torch.tensor([2.0]), (2, 8, 4, 4))
+    forecast = runtime.begin_step(_step_options("run-a", 3, 3.0, False), torch.tensor([3.0]), (2, 8, 4, 4))
     assert forecast["actual_forward"] is False
 
     runtime.finalize_step(forecast["stream_key"], forecast["solver_step_id"], used_forecast=False)
 
     state = runtime.stream_states[forecast["stream_key"]]
     assert runtime.last_info["forecasted_passes"] == 0
-    assert runtime.last_info["actual_forward_count"] == 3
+    assert runtime.last_info["actual_forward_count"] == 4
     assert state.num_consecutive_cached_steps == 0
     assert state.decisions_by_solver_step[forecast["solver_step_id"]]["actual_forward"] is True
     assert state.decisions_by_solver_step[forecast["solver_step_id"]]["finalized"] is True
@@ -659,10 +708,12 @@ def test_forecaster_chebyshev_fit_falls_back_to_observed_sigma_range() -> None:
 
 def test_runtime_uses_schedule_wide_sigma_bounds_for_forecast_fit() -> None:
     """When sample_sigmas are available, the fit must use the full active schedule span."""
-    runtime = SpectrumSDXLRuntime(_make_cfg())
+    cfg = _make_relaxed_cfg()
+    cfg.tail_actual_steps = 0
+    runtime = SpectrumSDXLRuntime(cfg.validated())
     sample_sigmas = torch.tensor([10.0, 9.0, 1.0, 0.0], dtype=torch.float32)
 
-    for solver_step_id, time_coord, value in ((0, 10.0, 10.0), (1, 9.0, 9.0)):
+    for solver_step_id, time_coord, value in ((0, 10.0, 10.0), (1, 9.0, 9.0), (2, 1.0, 1.0)):
         decision = runtime.begin_step(
             {
                 "sample_sigmas": sample_sigmas,
@@ -689,14 +740,16 @@ def test_runtime_uses_schedule_wide_sigma_bounds_for_forecast_fit() -> None:
             "uuids": ("u0",),
             "cond_or_uncond": (0,),
             "spectrum_run_id": "run-a",
-            "spectrum_solver_step_id": 2,
+            "spectrum_solver_step_id": 3,
             "spectrum_time_coord": 1.0,
             "spectrum_actual_forward": False,
-            "spectrum_total_steps": 3,
+            "spectrum_total_steps": 4,
         },
         torch.tensor([1.0]),
         (1, 1, 1, 1),
     )
+    assert forecast["actual_forward"] is False
+    assert forecast["forecast_safe"] is True
 
     pred = runtime.predict_feature(forecast["stream_key"], forecast["solver_step_id"])
     state = runtime.stream_states[forecast["stream_key"]]
@@ -704,6 +757,96 @@ def test_runtime_uses_schedule_wide_sigma_bounds_for_forecast_fit() -> None:
     assert torch.allclose(torch.tensor(state.forecaster._fit_cache.coord_min), torch.tensor(1.0), atol=1e-6)
     assert torch.allclose(torch.tensor(state.forecaster._fit_cache.coord_max), torch.tensor(10.0), atol=1e-6)
     assert torch.isfinite(pred).all()
+
+
+def test_runtime_holds_forecasting_until_conservative_min_fit_points() -> None:
+    """The runtime must stay real until the configured conservative fit threshold is met."""
+    runtime = SpectrumSDXLRuntime(
+        SpectrumSDXLConfig(
+            blend_weight=0.5,
+            degree=1,
+            ridge_lambda=0.1,
+            window_size=2.0,
+            flex_window=0.75,
+            warmup_steps=0,
+            tail_actual_steps=0,
+            min_fit_points=6,
+        ).validated()
+    )
+
+    for step_id in range(5):
+        decision = runtime.begin_step(
+            _step_options("run-a", step_id, float(step_id), False, total_steps=10),
+            torch.tensor([float(step_id)]),
+            (1, 1, 1, 1),
+        )
+        assert decision["actual_forward"] is True
+        assert decision["forecast_safe"] is False
+        runtime.observe_actual_feature(
+            decision["stream_key"],
+            decision["solver_step_id"],
+            torch.full((1, 1, 1, 1), float(step_id), dtype=torch.float16),
+        )
+
+    blocked = runtime.begin_step(
+        _step_options("run-a", 5, 5.0, False, total_steps=10),
+        torch.tensor([5.0]),
+        (1, 1, 1, 1),
+    )
+    assert blocked["actual_forward"] is True
+    assert blocked["forecast_safe"] is False
+
+    runtime.observe_actual_feature(
+        blocked["stream_key"],
+        blocked["solver_step_id"],
+        torch.full((1, 1, 1, 1), 5.0, dtype=torch.float16),
+    )
+
+    ready = runtime.begin_step(
+        _step_options("run-a", 6, 6.0, False, total_steps=10),
+        torch.tensor([6.0]),
+        (1, 1, 1, 1),
+    )
+    assert ready["actual_forward"] is False
+    assert ready["forecast_safe"] is True
+
+
+def test_runtime_blocks_forecast_when_recent_validation_error_is_bad() -> None:
+    """A bad recent one-step holdout must fail open even after the count gate passes."""
+    runtime = SpectrumSDXLRuntime(
+        SpectrumSDXLConfig(
+            blend_weight=0.5,
+            degree=1,
+            ridge_lambda=0.1,
+            window_size=2.0,
+            flex_window=0.75,
+            warmup_steps=0,
+            tail_actual_steps=0,
+            min_fit_points=3,
+        ).validated()
+    )
+
+    for step_id, value in ((0, 0.0), (1, 0.0), (2, 100.0)):
+        decision = runtime.begin_step(
+            _step_options("run-a", step_id, float(step_id), True, total_steps=10),
+            torch.tensor([float(step_id)]),
+            (1, 1, 1, 1),
+        )
+        runtime.observe_actual_feature(
+            decision["stream_key"],
+            decision["solver_step_id"],
+            torch.full((1, 1, 1, 1), value, dtype=torch.float16),
+        )
+
+    blocked = runtime.begin_step(
+        _step_options("run-a", 3, 3.0, False, total_steps=10),
+        torch.tensor([3.0]),
+        (1, 1, 1, 1),
+    )
+    assert blocked["actual_forward"] is True
+    assert blocked["forecast_safe"] is False
+    assert blocked["recent_validation_rel_l2"] is not None
+    assert blocked["recent_validation_rel_l2"] > 0.35
 
 
 def test_chebyshev_prediction_varies_with_time_coord() -> None:
@@ -726,7 +869,7 @@ def test_chebyshev_prediction_varies_with_time_coord() -> None:
 
 def test_tail_actual_steps_force_real_tail_even_with_ready_history() -> None:
     """The configured tail must stay on the real path even when forecasting is ready."""
-    cfg = _make_cfg()
+    cfg = _make_relaxed_cfg()
     cfg.tail_actual_steps = 1
     runtime = SpectrumSDXLRuntime(cfg.validated())
     coords = (10.0, 8.0, 6.0, 4.0, 2.0)
@@ -753,39 +896,45 @@ def test_tail_actual_steps_force_real_tail_even_with_ready_history() -> None:
         torch.full((2, 8, 4, 4), 2.0, dtype=torch.float16),
     )
 
-    third = runtime.begin_step(
-        _step_options("run-a", 2, coords[2], False, total_steps=5),
+    third_actual = runtime.begin_step(
+        _step_options("run-a", 2, coords[2], True, total_steps=5),
         torch.tensor([coords[2]]),
         (2, 8, 4, 4),
     )
-    assert third["solver_step_id"] == 2
+    runtime.observe_actual_feature(
+        third_actual["stream_key"],
+        third_actual["solver_step_id"],
+        torch.full((2, 8, 4, 4), 3.0, dtype=torch.float16),
+    )
+
+    third = runtime.begin_step(
+        _step_options("run-a", 3, coords[3], False, total_steps=5),
+        torch.tensor([coords[3]]),
+        (2, 8, 4, 4),
+    )
+    assert third["solver_step_id"] == 3
     assert third["actual_forward"] is False
     assert third["forecast_safe"] is True
     runtime.finalize_step(third["stream_key"], third["solver_step_id"], used_forecast=True)
 
     fourth = runtime.begin_step(
-        _step_options("run-a", 3, coords[3], False, total_steps=5),
-        torch.tensor([coords[3]]),
-        (2, 8, 4, 4),
-    )
-    assert fourth["solver_step_id"] == 3
-    assert fourth["actual_forward"] is False
-    assert fourth["forecast_safe"] is True
-    runtime.finalize_step(fourth["stream_key"], fourth["solver_step_id"], used_forecast=True)
-
-    fifth = runtime.begin_step(
         _step_options("run-a", 4, coords[4], False, total_steps=5),
         torch.tensor([coords[4]]),
         (2, 8, 4, 4),
     )
-    assert fifth["solver_step_id"] == 4
-    assert fifth["actual_forward"] is True
-    assert fifth["forecast_safe"] is False
+    assert fourth["solver_step_id"] == 4
+    assert fourth["actual_forward"] is True
+    assert fourth["forecast_safe"] is False
+    runtime.observe_actual_feature(
+        fourth["stream_key"],
+        fourth["solver_step_id"],
+        torch.full((2, 8, 4, 4), 4.0, dtype=torch.float16),
+    )
 
 
 def test_tail_actual_steps_zero_preserves_existing_scheduler_behavior() -> None:
     """Disabling the tail override must keep the old scheduling path intact."""
-    cfg = _make_cfg()
+    cfg = _make_relaxed_cfg()
     cfg.tail_actual_steps = 0
     runtime = SpectrumSDXLRuntime(cfg.validated())
     coords = (10.0, 8.0, 6.0, 4.0, 2.0)
@@ -812,34 +961,36 @@ def test_tail_actual_steps_zero_preserves_existing_scheduler_behavior() -> None:
         torch.full((2, 8, 4, 4), 2.0, dtype=torch.float16),
     )
 
-    third = runtime.begin_step(
-        _step_options("run-a", 2, coords[2], False, total_steps=5),
+    third_actual = runtime.begin_step(
+        _step_options("run-a", 2, coords[2], True, total_steps=5),
         torch.tensor([coords[2]]),
         (2, 8, 4, 4),
     )
-    assert third["solver_step_id"] == 2
+    runtime.observe_actual_feature(
+        third_actual["stream_key"],
+        third_actual["solver_step_id"],
+        torch.full((2, 8, 4, 4), 3.0, dtype=torch.float16),
+    )
+
+    third = runtime.begin_step(
+        _step_options("run-a", 3, coords[3], False, total_steps=5),
+        torch.tensor([coords[3]]),
+        (2, 8, 4, 4),
+    )
+    assert third["solver_step_id"] == 3
     assert third["actual_forward"] is False
     assert third["forecast_safe"] is True
     runtime.finalize_step(third["stream_key"], third["solver_step_id"], used_forecast=True)
 
     fourth = runtime.begin_step(
-        _step_options("run-a", 3, coords[3], False, total_steps=5),
-        torch.tensor([coords[3]]),
-        (2, 8, 4, 4),
-    )
-    assert fourth["solver_step_id"] == 3
-    assert fourth["actual_forward"] is False
-    assert fourth["forecast_safe"] is True
-    runtime.finalize_step(fourth["stream_key"], fourth["solver_step_id"], used_forecast=True)
-
-    fifth = runtime.begin_step(
         _step_options("run-a", 4, coords[4], False, total_steps=5),
         torch.tensor([coords[4]]),
         (2, 8, 4, 4),
     )
-    assert fifth["solver_step_id"] == 4
-    assert fifth["actual_forward"] is False
-    assert fifth["forecast_safe"] is True
+    assert fourth["solver_step_id"] == 4
+    assert fourth["actual_forward"] is False
+    assert fourth["forecast_safe"] is True
+    runtime.finalize_step(fourth["stream_key"], fourth["solver_step_id"], used_forecast=True)
 
 
 def test_tail_actual_steps_greater_than_total_steps_forces_all_steps_real() -> None:
@@ -875,6 +1026,7 @@ def test_sdxl_wrapper_forecasts_final_output_for_non_codebook_path() -> None:
         flex_window=0.75,
         warmup_steps=0,
         tail_actual_steps=0,
+        min_fit_points=3,
     ).validated()
     runtime = SpectrumSDXLRuntime(cfg)
 
@@ -957,20 +1109,27 @@ def test_sdxl_wrapper_forecasts_final_output_for_non_codebook_path() -> None:
             timesteps=torch.tensor([1.0]),
             transformer_options=_options(1, 1.0, True),
         )
+        third = inner._forward(
+            torch.full((1, 1, 1, 1), 3.0),
+            timesteps=torch.tensor([2.0]),
+            transformer_options=_options(2, 2.0, True),
+        )
         forecast = inner._forward(
             torch.full((1, 1, 1, 1), 999.0),
-            timesteps=torch.tensor([2.0]),
-            transformer_options=_options(2, 2.0, False),
+            timesteps=torch.tensor([3.0]),
+            transformer_options=_options(3, 3.0, False),
         )
 
         assert torch.allclose(first, torch.full((1, 1, 1, 1), 1.0))
         assert torch.allclose(second, torch.full((1, 1, 1, 1), 4.0))
-        assert torch.allclose(forecast, torch.full((1, 1, 1, 1), 7.0), atol=1e-5)
+        assert torch.allclose(third, torch.full((1, 1, 1, 1), 9.0))
+        assert torch.allclose(forecast, torch.full((1, 1, 1, 1), 14.0), atol=1e-5)
 
         state = next(iter(runtime.stream_states.values()))
-        assert len(state.forecaster.history) == 2
+        assert len(state.forecaster.history) == 3
         assert torch.allclose(state.forecaster.history[0][1], torch.full((1, 1, 1, 1), 1.0))
         assert torch.allclose(state.forecaster.history[1][1], torch.full((1, 1, 1, 1), 4.0))
+        assert torch.allclose(state.forecaster.history[2][1], torch.full((1, 1, 1, 1), 9.0))
     finally:
         for name, module in saved_modules.items():
             if module is None:
@@ -1003,6 +1162,8 @@ def main() -> None:
     test_run_id_switch_resets_stream_state()
     test_forecaster_chebyshev_fit_falls_back_to_observed_sigma_range()
     test_runtime_uses_schedule_wide_sigma_bounds_for_forecast_fit()
+    test_runtime_holds_forecasting_until_conservative_min_fit_points()
+    test_runtime_blocks_forecast_when_recent_validation_error_is_bad()
     test_chebyshev_prediction_varies_with_time_coord()
     test_tail_actual_steps_force_real_tail_even_with_ready_history()
     test_tail_actual_steps_zero_preserves_existing_scheduler_behavior()
