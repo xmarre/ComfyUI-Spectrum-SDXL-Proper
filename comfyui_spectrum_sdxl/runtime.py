@@ -172,12 +172,12 @@ class SpectrumSDXLRuntime:
             return None
         return float(min(values)), float(max(values))
 
-    def _model_time_coord_bounds(
+    def _observed_coord_bounds(
         self,
         state: _StreamState,
         current_time_coord: float,
     ) -> Optional[Tuple[float, float]]:
-        """Return bounds for the active model-time axis within this stream."""
+        """Return bounds for the active forecast axis within this stream."""
         values = [float(current_time_coord)]
         for decision in state.decisions_by_solver_step.values():
             coord = decision.get("time_coord", None)
@@ -196,7 +196,8 @@ class SpectrumSDXLRuntime:
         run_id = transformer_options.get(_RUN_ID_KEY, None)
         solver_step_id = transformer_options.get(_SOLVER_STEP_ID_KEY, None)
         sigma_coord = transformer_options.get(_TIME_COORD_KEY, None)
-        time_coord = transformer_options.get(_MODEL_TIME_COORD_KEY, sigma_coord)
+        model_time_coord = transformer_options.get(_MODEL_TIME_COORD_KEY, None)
+        time_coord = sigma_coord
         actual_forward = transformer_options.get(_ACTUAL_FORWARD_KEY, None)
 
         if run_id is None and solver_step_id is None and time_coord is None and sigma_coord is None and actual_forward is None:
@@ -219,6 +220,15 @@ class SpectrumSDXLRuntime:
         if not math.isfinite(time_coord) or not math.isfinite(sigma_coord):
             return None, "invalid_solver_step_context"
 
+        if model_time_coord is not None:
+            try:
+                model_time_coord = float(model_time_coord)
+            except (TypeError, ValueError):
+                model_time_coord = None
+            else:
+                if not math.isfinite(model_time_coord):
+                    model_time_coord = None
+
         if actual_forward is not None and not isinstance(actual_forward, bool):
             return None, "invalid_solver_step_context"
 
@@ -226,6 +236,7 @@ class SpectrumSDXLRuntime:
             "run_id": run_id,
             "solver_step_id": solver_step_id,
             "time_coord": time_coord,
+            "model_time_coord": model_time_coord,
             "sigma_coord": sigma_coord,
             "actual_forward": actual_forward,
             "total_steps": self._extract_total_steps(transformer_options),
@@ -324,6 +335,7 @@ class SpectrumSDXLRuntime:
                 "forecast_safe": False,
                 "finalized": False,
                 "time_coord": None,
+                "model_time_coord": None,
                 "sigma_coord": None,
                 "total_steps": self.num_steps(),
             }
@@ -354,15 +366,15 @@ class SpectrumSDXLRuntime:
                 "forecast_safe": False,
                 "finalized": False,
                 "time_coord": ctx["time_coord"],
+                "model_time_coord": ctx.get("model_time_coord", None),
                 "sigma_coord": ctx["sigma_coord"],
                 "total_steps": ctx["total_steps"],
             }
 
         state = self._ensure_stream_state(stream_key, ctx["run_id"])
-        if _MODEL_TIME_COORD_KEY in transformer_options:
-            schedule_coord_bounds = self._model_time_coord_bounds(state, ctx["time_coord"])
-        else:
-            schedule_coord_bounds = self._schedule_coord_bounds(transformer_options)
+        schedule_coord_bounds = self._schedule_coord_bounds(transformer_options)
+        if schedule_coord_bounds is None:
+            schedule_coord_bounds = self._observed_coord_bounds(state, ctx["time_coord"])
         if schedule_coord_bounds is not None:
             state.forecaster.set_coord_bounds(*schedule_coord_bounds)
         existing = state.decisions_by_solver_step.get(ctx["solver_step_id"])
@@ -410,6 +422,7 @@ class SpectrumSDXLRuntime:
             "forecast_safe": forecast_safe,
             "finalized": False,
             "time_coord": ctx["time_coord"],
+            "model_time_coord": ctx.get("model_time_coord", None),
             "recent_validation_rel_l2": recent_validation_rel_l2,
             "sigma_coord": ctx["sigma_coord"],
             "total_steps": ctx["total_steps"],
@@ -420,7 +433,7 @@ class SpectrumSDXLRuntime:
             print(
                 f"[Spectrum SDXL] begin "
                 f"run={ctx['run_id']} step={ctx['solver_step_id']} "
-                f"sigma={ctx['sigma_coord']} model_time={ctx['time_coord']} "
+                f"sigma={ctx['sigma_coord']} model_time={ctx.get('model_time_coord', None)} "
                 f"val_rel_l2={recent_validation_rel_l2} "
                 f"local={local_step_count} actual={actual_forward} "
                 f"forecast_safe={forecast_safe} ready={state.forecaster.ready()} "

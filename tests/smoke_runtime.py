@@ -161,8 +161,8 @@ def test_explicit_solver_step_context_allows_forecast() -> None:
     assert runtime.last_info["forecasted_passes"] == 1
 
 
-def test_runtime_prefers_model_time_coord_for_forecasting() -> None:
-    """The forecast axis should follow model-time while sigma still validates the schedule."""
+def test_runtime_prefers_sigma_coord_for_forecasting_even_when_model_time_is_present() -> None:
+    """The forecast axis should stay on raw sigma even when model-time metadata is present."""
     runtime = SpectrumSDXLRuntime(_make_relaxed_cfg())
     sample_sigmas = torch.tensor([14.0, 7.0, 3.0, 1.5, 0.75, 0.25, 0.0], dtype=torch.float32)
 
@@ -237,7 +237,8 @@ def test_runtime_prefers_model_time_coord_for_forecasting() -> None:
         (2, 8, 4, 4),
     )
 
-    assert forecast["time_coord"] == 400.0
+    assert forecast["time_coord"] == 1.5
+    assert forecast["model_time_coord"] == 400.0
     assert forecast["sigma_coord"] == 1.5
     assert forecast["actual_forward"] is False
     assert forecast["forecast_safe"] is True
@@ -249,8 +250,8 @@ def test_runtime_prefers_model_time_coord_for_forecasting() -> None:
     state = runtime.stream_states[forecast["stream_key"]]
     fit_cache = state.forecaster._fit_cache
     assert fit_cache is not None
-    assert torch.allclose(torch.tensor(fit_cache.coord_min), torch.tensor(100.0), atol=1e-6)
-    assert torch.allclose(torch.tensor(fit_cache.coord_max), torch.tensor(400.0), atol=1e-6)
+    assert torch.allclose(torch.tensor(fit_cache.coord_min), torch.tensor(0.25), atol=1e-6)
+    assert torch.allclose(torch.tensor(fit_cache.coord_max), torch.tensor(14.0), atol=1e-6)
 
 
 def test_explicit_solver_step_context_without_decision_still_schedules() -> None:
@@ -1274,7 +1275,7 @@ def main() -> None:
     test_invalid_solver_step_context_fails_open()
     test_missing_stream_identity_fails_open()
     test_explicit_solver_step_context_allows_forecast()
-    test_runtime_prefers_model_time_coord_for_forecasting()
+    test_runtime_prefers_sigma_coord_for_forecasting_even_when_model_time_is_present()
     test_explicit_solver_step_context_without_decision_still_schedules()
     test_outer_step_controller_injects_context_and_resets_runs()
     test_outer_step_controller_same_object_restart_resets_run_state()
