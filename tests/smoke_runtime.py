@@ -985,6 +985,7 @@ def main() -> None:
     test_invalid_solver_step_context_fails_open()
     test_missing_stream_identity_fails_open()
     test_explicit_solver_step_context_allows_forecast()
+    test_runtime_prefers_model_time_coord_for_forecasting()
     test_explicit_solver_step_context_without_decision_still_schedules()
     test_outer_step_controller_injects_context_and_resets_runs()
     test_outer_step_controller_same_object_restart_resets_run_state()
