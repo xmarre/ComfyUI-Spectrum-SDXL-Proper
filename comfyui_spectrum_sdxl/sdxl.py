@@ -335,6 +335,13 @@ def _wrap_sdxl_unet_forward(inner: Any) -> None:
 
     original_forward = inner._forward
 
+    non_codebook_target_head = None
+    non_codebook_projector = None
+    out_head = getattr(inner, "out", None)
+    if isinstance(out_head, torch.nn.Sequential) and len(out_head) >= 2:
+        non_codebook_target_head = out_head[:-1]
+        non_codebook_projector = out_head[-1]
+
     def _rel_l2(pred: torch.Tensor, actual: torch.Tensor) -> float:
         pred_f = pred.detach().to(torch.float32)
         actual_f = actual.detach().to(torch.float32)
@@ -350,6 +357,18 @@ def _wrap_sdxl_unet_forward(inner: Any) -> None:
         if denom < 1e-12:
             return 0.0
         return float(torch.dot(pred_f, actual_f).item() / denom)
+
+    def _compute_non_codebook_target(h: torch.Tensor) -> torch.Tensor:
+        """Return the forecast target for the normal SDXL output path."""
+        if non_codebook_target_head is None:
+            return inner.out(h)
+        return non_codebook_target_head(h)
+
+    def _project_non_codebook_target(feature: torch.Tensor) -> torch.Tensor:
+        """Project a normal-path forecast target back to the returned denoiser output."""
+        if non_codebook_projector is None:
+            return feature
+        return non_codebook_projector(feature)
 
     def wrapped_forward(
         x,
@@ -401,7 +420,7 @@ def _wrap_sdxl_unet_forward(inner: Any) -> None:
         solver_step_id = decision["solver_step_id"]
         actual_forward = decision["actual_forward"]
         stream_key = decision["stream_key"]
-        predicts_codebook_ids = getattr(inner, "predict_codebook_ids", False)
+        predicts_codebook_ids = bool(getattr(inner, "predict_codebook_ids", False))
         predicted_feature = None
 
         transformer_options["original_shape"] = list(x.shape)
@@ -422,7 +441,7 @@ def _wrap_sdxl_unet_forward(inner: Any) -> None:
                 runtime.finalize_step(stream_key, solver_step_id, used_forecast=True)
                 if predicts_codebook_ids:
                     return inner.id_predictor(predicted_feature)
-                return predicted_feature
+                return _project_non_codebook_target(predicted_feature)
 
         transformer_patches = transformer_options.get("patches", {})
         num_video_frames = kwargs.get("num_video_frames", transformer_options.get("num_video_frames", 1))
@@ -512,39 +531,50 @@ def _wrap_sdxl_unet_forward(inner: Any) -> None:
             )
 
         h = h.type(x.dtype)
+        actual_feature = None
+        actual_out = None
         if predicts_codebook_ids:
-            runtime.observe_actual_feature(stream_key, solver_step_id, h)
+            actual_feature = h
+            runtime.observe_actual_feature(stream_key, solver_step_id, actual_feature)
         else:
-            actual_out = inner.out(h)
-            runtime.observe_actual_feature(stream_key, solver_step_id, actual_out)
+            actual_feature = _compute_non_codebook_target(h)
+            runtime.observe_actual_feature(stream_key, solver_step_id, actual_feature)
+            actual_out = _project_non_codebook_target(actual_feature)
 
         if predicted_feature is not None and runtime.cfg.debug:
-            sigma = None
+            model_time = None
             if timesteps is not None:
                 try:
-                    sigma = float(timesteps.detach().flatten()[0].item())
+                    model_time = float(timesteps.detach().flatten()[0].item())
                 except Exception:
-                    sigma = None
+                    model_time = None
 
             if predicts_codebook_ids:
-                predicted_feature = predicted_feature.to(device=h.device, dtype=h.dtype)
+                predicted_feature = predicted_feature.to(device=actual_feature.device, dtype=actual_feature.dtype)
                 print(
                     "[Spectrum SDXL] shadow_compare "
                     f"step={solver_step_id} "
-                    f"sigma={sigma} "
-                    f"pre_rel_l2={_rel_l2(predicted_feature, h):.6f} "
-                    f"pre_cos={_cosine(predicted_feature, h):.6f} "
+                    f"model_time={model_time} "
+                    f"pre_rel_l2={_rel_l2(predicted_feature, actual_feature):.6f} "
+                    f"pre_cos={_cosine(predicted_feature, actual_feature):.6f} "
                     f"out_compare=skipped_codebook_ids"
                 )
             else:
-                predicted_feature = predicted_feature.to(device=actual_out.device, dtype=actual_out.dtype)
+                predicted_feature = predicted_feature.to(device=actual_feature.device, dtype=actual_feature.dtype)
+                pred_out = _project_non_codebook_target(predicted_feature).to(
+                    device=actual_out.device,
+                    dtype=actual_out.dtype,
+                )
                 print(
                     "[Spectrum SDXL] shadow_compare "
                     f"step={solver_step_id} "
-                    f"sigma={sigma} "
-                    f"target=denoiser_output "
-                    f"out_rel_l2={_rel_l2(predicted_feature, actual_out):.6f} "
-                    f"out_cos={_cosine(predicted_feature, actual_out):.6f}"
+                    f"model_time={model_time} "
+                    f"target="
+                    f"{'pre_final_projection' if non_codebook_projector is not None else 'denoiser_output'} "
+                    f"target_rel_l2={_rel_l2(predicted_feature, actual_feature):.6f} "
+                    f"target_cos={_cosine(predicted_feature, actual_feature):.6f} "
+                    f"out_rel_l2={_rel_l2(pred_out, actual_out):.6f} "
+                    f"out_cos={_cosine(pred_out, actual_out):.6f}"
                 )
                 return actual_out
 
