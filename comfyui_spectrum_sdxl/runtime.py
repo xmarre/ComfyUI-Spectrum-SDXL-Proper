@@ -178,15 +178,15 @@ class SpectrumSDXLRuntime:
         current_time_coord: float,
     ) -> Optional[Tuple[float, float]]:
         """Return bounds for the active forecast axis within this stream."""
-        values = [float(current_time_coord)]
-        for decision in state.decisions_by_solver_step.values():
-            coord = decision.get("time_coord", None)
-            if coord is None:
-                continue
+        del current_time_coord
+        values = []
+        for coord, _ in state.forecaster.history:
             try:
-                values.append(float(coord))
+                coord = float(coord)
             except (TypeError, ValueError):
                 continue
+            if math.isfinite(coord):
+                values.append(coord)
         if not values:
             return None
         return float(min(values)), float(max(values))

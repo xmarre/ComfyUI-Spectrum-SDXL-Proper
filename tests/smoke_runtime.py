@@ -707,6 +707,25 @@ def test_forecaster_chebyshev_fit_falls_back_to_observed_sigma_range() -> None:
     assert torch.isfinite(pred).all()
 
 
+def test_runtime_fallback_coord_bounds_ignore_unobserved_candidate_step() -> None:
+    """Fallback bounds must come only from observed feature history, not pending steps."""
+    runtime = SpectrumSDXLRuntime(_make_relaxed_cfg())
+
+    first = runtime.begin_step(_step_options("run-a", 0, 10.0, True), torch.tensor([10.0]), (1, 1, 1, 1))
+    runtime.observe_actual_feature(
+        first["stream_key"],
+        first["solver_step_id"],
+        torch.full((1, 1, 1, 1), 10.0, dtype=torch.float16),
+    )
+
+    second = runtime.begin_step(_step_options("run-a", 1, 1.0, True), torch.tensor([1.0]), (1, 1, 1, 1))
+    state = runtime.stream_states[second["stream_key"]]
+
+    assert state.forecaster._coord_bounds is not None
+    assert torch.allclose(torch.tensor(state.forecaster._coord_bounds[0]), torch.tensor(10.0), atol=1e-6)
+    assert torch.allclose(torch.tensor(state.forecaster._coord_bounds[1]), torch.tensor(10.0), atol=1e-6)
+
+
 def test_runtime_uses_schedule_wide_sigma_bounds_for_forecast_fit() -> None:
     """When sample_sigmas are available, the fit must use the full active schedule span."""
     cfg = _make_relaxed_cfg()
@@ -1292,6 +1311,7 @@ def main() -> None:
     test_forecast_fallback_commits_actual_bookkeeping()
     test_run_id_switch_resets_stream_state()
     test_forecaster_chebyshev_fit_falls_back_to_observed_sigma_range()
+    test_runtime_fallback_coord_bounds_ignore_unobserved_candidate_step()
     test_runtime_uses_schedule_wide_sigma_bounds_for_forecast_fit()
     test_runtime_holds_forecasting_until_conservative_min_fit_points()
     test_runtime_blocks_forecast_when_recent_validation_error_is_bad()
