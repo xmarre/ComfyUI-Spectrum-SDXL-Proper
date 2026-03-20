@@ -12,6 +12,7 @@ from comfyui_spectrum_sdxl.forecast import ChebyshevFeatureForecaster
 from comfyui_spectrum_sdxl.runtime import SpectrumSDXLRuntime
 from comfyui_spectrum_sdxl.sdxl import (
     _RUNTIME_KEY,
+    _MODEL_TIME_COORD_KEY,
     _SpectrumModelFunctionWrapper,
     _SpectrumOuterStepController,
     _wrap_sdxl_unet_forward,
@@ -38,6 +39,8 @@ def _step_options(
     total_steps: int = 6,
     uuid: str = "stream-a",
     cond: int = 0,
+    model_time_coord: float | None = None,
+    sample_sigmas: torch.Tensor | None = None,
 ):
     """Create explicit outer-step context for one logical stream."""
     options = {
@@ -48,6 +51,10 @@ def _step_options(
         "uuids": [uuid],
         "cond_or_uncond": [cond],
     }
+    if model_time_coord is not None:
+        options[_MODEL_TIME_COORD_KEY] = model_time_coord
+    if sample_sigmas is not None:
+        options["sample_sigmas"] = sample_sigmas
     if actual_forward is not None:
         options["spectrum_actual_forward"] = actual_forward
     return options
@@ -130,6 +137,79 @@ def test_explicit_solver_step_context_allows_forecast() -> None:
 
     runtime.finalize_step(forecast["stream_key"], forecast["solver_step_id"], used_forecast=True)
     assert runtime.last_info["forecasted_passes"] == 1
+
+
+def test_runtime_prefers_model_time_coord_for_forecasting() -> None:
+    """The forecast axis should follow model-time while sigma still validates the schedule."""
+    runtime = SpectrumSDXLRuntime(_make_cfg())
+    sample_sigmas = torch.tensor([14.0, 7.0, 3.0, 1.5, 0.75, 0.25, 0.0], dtype=torch.float32)
+
+    first = runtime.begin_step(
+        _step_options(
+            "run-a",
+            0,
+            14.0,
+            True,
+            total_steps=6,
+            model_time_coord=100.0,
+            sample_sigmas=sample_sigmas,
+        ),
+        torch.tensor([100.0]),
+        (2, 8, 4, 4),
+    )
+    runtime.observe_actual_feature(
+        first["stream_key"],
+        first["solver_step_id"],
+        torch.full((2, 8, 4, 4), 1.0, dtype=torch.float16),
+    )
+
+    second = runtime.begin_step(
+        _step_options(
+            "run-a",
+            1,
+            7.0,
+            True,
+            total_steps=6,
+            model_time_coord=200.0,
+            sample_sigmas=sample_sigmas,
+        ),
+        torch.tensor([200.0]),
+        (2, 8, 4, 4),
+    )
+    runtime.observe_actual_feature(
+        second["stream_key"],
+        second["solver_step_id"],
+        torch.full((2, 8, 4, 4), 2.0, dtype=torch.float16),
+    )
+
+    forecast = runtime.begin_step(
+        _step_options(
+            "run-a",
+            2,
+            3.0,
+            False,
+            total_steps=6,
+            model_time_coord=300.0,
+            sample_sigmas=sample_sigmas,
+        ),
+        torch.tensor([300.0]),
+        (2, 8, 4, 4),
+    )
+
+    assert forecast["time_coord"] == 300.0
+    assert forecast["sigma_coord"] == 3.0
+    assert forecast["actual_forward"] is False
+    assert forecast["forecast_safe"] is True
+
+    pred = runtime.predict_feature(forecast["stream_key"], forecast["solver_step_id"])
+    assert pred.shape == (2, 8, 4, 4)
+    assert torch.isfinite(pred).all()
+
+    state = runtime.stream_states[forecast["stream_key"]]
+    fit_cache = state.forecaster._fit_cache
+    assert fit_cache is not None
+    assert torch.allclose(torch.tensor(fit_cache.coord_min), torch.tensor(100.0), atol=1e-6)
+    assert torch.allclose(torch.tensor(fit_cache.coord_max), torch.tensor(300.0), atol=1e-6)
 
 
 def test_explicit_solver_step_context_without_decision_still_schedules() -> None:
@@ -248,7 +328,7 @@ def test_runtime_disables_forecasting_when_time_coord_does_not_match_schedule() 
     )
     assert decision["actual_forward"] is True
     assert decision["forecast_safe"] is False
-    assert runtime.last_info["forecast_disable_reason"] == "solver-step time_coord did not match the active schedule"
+    assert runtime.last_info["forecast_disable_reason"] == "solver-step sigma_coord did not match the active schedule"
 
 
 def test_model_function_wrapper_injects_context_for_bypassed_guider_path() -> None:
